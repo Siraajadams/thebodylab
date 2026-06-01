@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 const supabase = createClient(
@@ -25,7 +25,9 @@ type Lead = {
   source: string;
   status: string;
   notes: string;
+  next_follow_up_date?: string;
   created_at: string;
+  updated_at?: string;
 };
 
 type Activity = {
@@ -37,6 +39,18 @@ type Activity = {
   created_at: string;
 };
 
+type Appointment = {
+  id: string;
+  lead_id: string;
+  appointment_date: string;
+  appointment_time: string;
+  doctor_name?: string;
+  appointment_type?: string;
+  notes?: string;
+  status?: string;
+  created_at?: string;
+};
+
 export default function Home() {
   const [loggedIn, setLoggedIn] = useState(false);
   const [pin, setPin] = useState("");
@@ -44,7 +58,22 @@ export default function Home() {
 
   const [leads, setLeads] = useState<Lead[]>([]);
   const [activities, setActivities] = useState<Activity[]>([]);
+  const [appointments, setAppointments] = useState<Appointment[]>([]);
+
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
+  const [bookingLead, setBookingLead] = useState<Lead | null>(null);
+  const [note, setNote] = useState("");
+
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("All");
+  const [sourceFilter, setSourceFilter] = useState("All");
+
+  const [appointmentForm, setAppointmentForm] = useState({
+    appointment_date: "",
+    appointment_time: "",
+    doctor_name: "",
+    notes: "",
+  });
 
   const [form, setForm] = useState({
     first_name: "",
@@ -54,6 +83,7 @@ export default function Home() {
     service_interest: "GP Weight Loss Consultation",
     source: "Manual Capture",
     notes: "",
+    next_follow_up_date: "",
   });
 
   useEffect(() => {
@@ -61,6 +91,7 @@ export default function Home() {
     if (saved === "yes") {
       setLoggedIn(true);
       loadLeads();
+      loadAppointments();
     }
   }, []);
 
@@ -76,6 +107,15 @@ export default function Home() {
     }
 
     setLeads(data || []);
+  }
+
+  async function loadAppointments() {
+    const { data, error } = await supabase
+      .from("appointments")
+      .select("*")
+      .order("appointment_date", { ascending: true });
+
+    if (!error) setAppointments(data || []);
   }
 
   async function loadActivities(leadId: string) {
@@ -102,6 +142,7 @@ export default function Home() {
       localStorage.setItem("bodylab_logged_in", "yes");
       setLoggedIn(true);
       loadLeads();
+      loadAppointments();
     } else {
       alert("Incorrect PIN");
     }
@@ -110,6 +151,34 @@ export default function Home() {
   function logout() {
     localStorage.removeItem("bodylab_logged_in");
     setLoggedIn(false);
+  }
+
+  function cleanPhone(phone: string) {
+    const digits = (phone || "").replace(/\D/g, "");
+    if (digits.startsWith("0")) return "27" + digits.slice(1);
+    return digits;
+  }
+
+  function whatsappUrl(lead: Lead, type: "contact" | "reminder" | "followup") {
+    const name = lead.first_name || "there";
+    const service = lead.service_interest || "your consultation";
+
+    const messages = {
+      contact: `Hi ${name}, thank you for your interest in BodyLab. We received your enquiry for ${service}. Would you like help booking your consultation?`,
+      reminder: `Hi ${name}, this is a reminder about your BodyLab consultation. Please let us know if you need to change your booking.`,
+      followup: `Hi ${name}, just following up to check whether you would still like to proceed with your BodyLab ${service}.`,
+    };
+
+    return `https://wa.me/${cleanPhone(lead.phone)}?text=${encodeURIComponent(messages[type])}`;
+  }
+
+  function alertStatus(lead: Lead) {
+    const date = new Date(lead.updated_at || lead.created_at).getTime();
+    const hours = (Date.now() - date) / 36e5;
+
+    if (hours > 48) return "🔴 No update over 48h";
+    if (hours > 24) return "🟠 No update over 24h";
+    return "🟢 Recently updated";
   }
 
   async function saveLead() {
@@ -140,6 +209,7 @@ export default function Home() {
       service_interest: "GP Weight Loss Consultation",
       source: "Manual Capture",
       notes: "",
+      next_follow_up_date: "",
     });
 
     loadLeads();
@@ -160,6 +230,11 @@ export default function Home() {
     }
 
     await logActivity(lead.id, `Status changed to ${newStatus}`, "status_change");
+
+    if (newStatus === "Consultation Booked") {
+      setBookingLead(lead);
+    }
+
     loadLeads();
 
     if (selectedLead?.id === lead.id) {
@@ -172,6 +247,62 @@ export default function Home() {
     loadActivities(lead.id);
   }
 
+  async function addTimelineNote() {
+    if (!selectedLead || !note.trim()) return;
+
+    await logActivity(selectedLead.id, note, "admin_note");
+    setNote("");
+    loadActivities(selectedLead.id);
+  }
+
+  async function saveAppointment() {
+    if (!bookingLead) return;
+
+    const { error } = await supabase.from("appointments").insert({
+      lead_id: bookingLead.id,
+      appointment_date: appointmentForm.appointment_date,
+      appointment_time: appointmentForm.appointment_time,
+      doctor_name: appointmentForm.doctor_name,
+      appointment_type: bookingLead.service_interest,
+      notes: appointmentForm.notes,
+      status: "Booked",
+    });
+
+    if (error) {
+      alert(error.message);
+      return;
+    }
+
+    await logActivity(
+      bookingLead.id,
+      `Appointment booked for ${appointmentForm.appointment_date} at ${appointmentForm.appointment_time}`,
+      "appointment"
+    );
+
+    setBookingLead(null);
+    setAppointmentForm({
+      appointment_date: "",
+      appointment_time: "",
+      doctor_name: "",
+      notes: "",
+    });
+
+    loadAppointments();
+    loadLeads();
+  }
+
+  const filteredLeads = useMemo(() => {
+    return leads.filter((lead) => {
+      const text = `${lead.full_name} ${lead.first_name} ${lead.surname} ${lead.phone} ${lead.email}`.toLowerCase();
+
+      return (
+        text.includes(search.toLowerCase()) &&
+        (statusFilter === "All" || lead.status === statusFilter) &&
+        (sourceFilter === "All" || lead.source === sourceFilter)
+      );
+    });
+  }, [leads, search, statusFilter, sourceFilter]);
+
   const stats = {
     total: leads.length,
     new: leads.filter((l) => l.status === "New Lead").length,
@@ -180,6 +311,12 @@ export default function Home() {
     converted: leads.filter((l) => l.status === "Converted").length,
     lost: leads.filter((l) => l.status === "Lost").length,
   };
+
+  const today = new Date().toISOString().slice(0, 10);
+  const todaysAppointments = appointments.filter((a) => a.appointment_date === today).length;
+  const conversionRate = stats.total ? Math.round((stats.converted / stats.total) * 100) : 0;
+  const bookedRate = stats.total ? Math.round((stats.booked / stats.total) * 100) : 0;
+  const lostRate = stats.total ? Math.round((stats.lost / stats.total) * 100) : 0;
 
   if (!loggedIn) {
     return (
@@ -222,6 +359,10 @@ export default function Home() {
           ["Booked", stats.booked],
           ["Converted", stats.converted],
           ["Lost", stats.lost],
+          ["Conversion %", `${conversionRate}%`],
+          ["Booked %", `${bookedRate}%`],
+          ["Lost %", `${lostRate}%`],
+          ["Today Appointments", todaysAppointments],
         ].map(([label, value]) => (
           <div key={label} style={cardStyle}>
             <h2>{value}</h2>
@@ -247,6 +388,13 @@ export default function Home() {
           <select style={inputStyle} value={form.source} onChange={(e) => setForm({ ...form, source: e.target.value })}>
             {sources.map((s) => <option key={s}>{s}</option>)}
           </select>
+
+          <input
+            type="date"
+            style={inputStyle}
+            value={form.next_follow_up_date}
+            onChange={(e) => setForm({ ...form, next_follow_up_date: e.target.value })}
+          />
         </div>
 
         <textarea
@@ -259,6 +407,21 @@ export default function Home() {
         <button onClick={saveLead} style={buttonStyle}>Save Lead</button>
       </section>
 
+      <section style={panelStyle}>
+        <h2>Search & Filters</h2>
+        <div style={formGrid}>
+          <input style={inputStyle} placeholder="Search name, phone or email" value={search} onChange={(e) => setSearch(e.target.value)} />
+          <select style={inputStyle} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option>All</option>
+            {statuses.map((s) => <option key={s}>{s}</option>)}
+          </select>
+          <select style={inputStyle} value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)}>
+            <option>All</option>
+            {sources.map((s) => <option key={s}>{s}</option>)}
+          </select>
+        </div>
+      </section>
+
       <h2>Pipeline</h2>
 
       <section style={pipelineGrid}>
@@ -266,22 +429,22 @@ export default function Home() {
           <div key={status} style={pipelineColumn}>
             <h3>{status}</h3>
 
-            {leads.filter((lead) => lead.status === status).map((lead) => (
+            {filteredLeads.filter((lead) => lead.status === status).map((lead) => (
               <div key={lead.id} style={leadCard}>
-                <strong>{lead.full_name || `${lead.first_name} ${lead.surname}`}</strong>
-                <p>{lead.phone}</p>
-                <p>{lead.email}</p>
+                <strong>🟢 {lead.full_name || `${lead.first_name} ${lead.surname}`}</strong>
+                <p>📞 {lead.phone}</p>
+                <p>✉️ {lead.email}</p>
 
-                <small><b>Service:</b><br />{lead.service_interest}</small><br /><br />
+                <small><b>Interested In:</b><br />{lead.service_interest}</small><br /><br />
                 <small><b>Source:</b><br />{lead.source}</small><br /><br />
+                <small><b>Created:</b><br />{new Date(lead.created_at).toLocaleDateString()}</small><br /><br />
+                <small><b>Follow-up:</b><br />{lead.next_follow_up_date || "Not set"}</small><br /><br />
 
-                <a
-                  href={`https://wa.me/${lead.phone?.replace(/^0/, "27")}?text=Hi%20${encodeURIComponent(lead.first_name || "")}%2C%20thank%20you%20for%20your%20interest%20in%20BodyLab.%20We%20received%20your%20enquiry%20for%20${encodeURIComponent(lead.service_interest || "")}.%20Would%20you%20like%20help%20booking%20your%20consultation%3F`}
-                  target="_blank"
-                  style={{ color: "green", fontWeight: "bold" }}
-                >
-                  WhatsApp Lead
-                </a>
+                <p>{alertStatus(lead)}</p>
+
+                <a href={whatsappUrl(lead, "contact")} target="_blank" style={linkStyle}>Contact Lead</a><br />
+                <a href={whatsappUrl(lead, "reminder")} target="_blank" style={linkStyle}>Reminder</a><br />
+                <a href={whatsappUrl(lead, "followup")} target="_blank" style={linkStyle}>Follow Up</a>
 
                 <select
                   value={lead.status}
@@ -291,9 +454,8 @@ export default function Home() {
                   {statuses.map((s) => <option key={s}>{s}</option>)}
                 </select>
 
-                <button onClick={() => openTimeline(lead)} style={lightButton}>
-                  View Timeline
-                </button>
+                <button onClick={() => openTimeline(lead)} style={lightButton}>View Timeline</button>
+                <button onClick={() => setBookingLead(lead)} style={lightButton}>Book Appointment</button>
               </div>
             ))}
           </div>
@@ -306,6 +468,15 @@ export default function Home() {
           <h2>Timeline</h2>
           <p>{selectedLead.full_name}</p>
 
+          <textarea
+            placeholder="Add note..."
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            style={{ ...inputStyle, width: "100%", minHeight: 80 }}
+          />
+
+          <button onClick={addTimelineNote} style={buttonStyle}>Add Note</button>
+
           {activities.length === 0 && <p>No timeline yet.</p>}
 
           {activities.map((a) => (
@@ -315,6 +486,44 @@ export default function Home() {
               <small>{new Date(a.created_at).toLocaleString()}</small>
             </div>
           ))}
+        </section>
+      )}
+
+      {bookingLead && (
+        <section style={timelinePanel}>
+          <button onClick={() => setBookingLead(null)} style={{ float: "right" }}>Close</button>
+          <h2>Book Appointment</h2>
+          <p>{bookingLead.full_name}</p>
+
+          <input
+            type="date"
+            style={inputStyle}
+            value={appointmentForm.appointment_date}
+            onChange={(e) => setAppointmentForm({ ...appointmentForm, appointment_date: e.target.value })}
+          />
+
+          <input
+            type="time"
+            style={inputStyle}
+            value={appointmentForm.appointment_time}
+            onChange={(e) => setAppointmentForm({ ...appointmentForm, appointment_time: e.target.value })}
+          />
+
+          <input
+            placeholder="Doctor / Practitioner"
+            style={inputStyle}
+            value={appointmentForm.doctor_name}
+            onChange={(e) => setAppointmentForm({ ...appointmentForm, doctor_name: e.target.value })}
+          />
+
+          <textarea
+            placeholder="Appointment notes"
+            style={{ ...inputStyle, width: "100%", minHeight: 90 }}
+            value={appointmentForm.notes}
+            onChange={(e) => setAppointmentForm({ ...appointmentForm, notes: e.target.value })}
+          />
+
+          <button onClick={saveAppointment} style={buttonStyle}>Save Appointment</button>
         </section>
       )}
     </main>
@@ -347,7 +556,7 @@ const loginBox: React.CSSProperties = {
 
 const statsGrid: React.CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "repeat(6, 1fr)",
+  gridTemplateColumns: "repeat(5, 1fr)",
   gap: 12,
   marginTop: 24,
 };
@@ -378,6 +587,7 @@ const inputStyle: React.CSSProperties = {
   padding: 12,
   borderRadius: 10,
   border: "1px solid #ddd",
+  marginBottom: 8,
 };
 
 const buttonStyle: React.CSSProperties = {
@@ -397,12 +607,14 @@ const lightButton: React.CSSProperties = {
   borderRadius: 8,
   background: "white",
   cursor: "pointer",
+  width: "100%",
 };
 
 const pipelineGrid: React.CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "repeat(5, 1fr)",
+  gridTemplateColumns: "repeat(5, minmax(220px, 1fr))",
   gap: 16,
+  overflowX: "auto",
 };
 
 const pipelineColumn: React.CSSProperties = {
@@ -425,16 +637,25 @@ const timelinePanel: React.CSSProperties = {
   right: 24,
   top: 24,
   bottom: 24,
-  width: 360,
+  width: 380,
   background: "white",
   padding: 24,
   borderRadius: 20,
   boxShadow: "0 20px 50px rgba(0,0,0,0.18)",
   overflowY: "auto",
+  zIndex: 20,
 };
 
 const timelineItem: React.CSSProperties = {
   borderLeft: "4px solid #111827",
   paddingLeft: 12,
   marginBottom: 16,
+  marginTop: 16,
+};
+
+const linkStyle: React.CSSProperties = {
+  color: "green",
+  fontWeight: "bold",
+  display: "inline-block",
+  marginTop: 4,
 };
