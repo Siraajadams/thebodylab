@@ -31,9 +31,7 @@ async function sendWhatsAppMessage(phone: string, message: string) {
 
     const result = await response.json();
     console.log("META STATUS:", response.status);
-    console.log("META RESPONSE:", result);
-
-    return result;
+    console.log("META RESPONSE:", JSON.stringify(result));
   } catch (error) {
     console.error("SEND WHATSAPP ERROR:", error);
   }
@@ -47,18 +45,22 @@ function isStartMessage(text: string) {
     t === "hello" ||
     t === "help" ||
     t === "register" ||
-    t.includes("want to register") ||
-    t.includes("i want to register")
+    t.includes("register") ||
+    t.includes("start") ||
+    t.includes("enquiry")
   );
 }
 
 function getService(text: string) {
   const t = text.toLowerCase().trim();
 
-  if (t === "1" || t.includes("weight")) return "GP Weight Loss Consultation";
-  if (t === "2" || t.includes("medical cannabis")) return "Medical Cannabis";
-  if (t === "3" || t.includes("longevity")) return "Longevity Assessment";
-  if (t === "4" || t.includes("general")) return "General Enquiry";
+  if (t === "1" || t.includes("gp") || t.includes("weight")) {
+    return "GP Weight Loss Consultation";
+  }
+
+  if (t === "2" || t.includes("glp")) {
+    return "GLP-treatment programme";
+  }
 
   return "";
 }
@@ -82,6 +84,7 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
 
     console.log("WHATSAPP WEBHOOK RECEIVED");
+    console.log(JSON.stringify(body));
 
     await supabase.from("webhook_events").insert({
       source: "whatsapp",
@@ -101,7 +104,7 @@ export async function POST(req: NextRequest) {
     const incomingText = message?.text?.body?.trim() || "";
     const profileName = contact?.profile?.name || "";
 
-    let { data: lead } = await supabase
+    let { data: lead, error: leadFetchError } = await supabase
       .from("leads")
       .select("*")
       .eq("phone", phone)
@@ -109,24 +112,32 @@ export async function POST(req: NextRequest) {
       .limit(1)
       .maybeSingle();
 
+    if (leadFetchError) {
+      console.error("LEAD FETCH ERROR:", leadFetchError);
+    }
+
     if (!lead) {
-      const { data: newLead, error } = await supabase
+      const { data: newLead, error: createLeadError } = await supabase
         .from("leads")
         .insert({
-          first_name: profileName || "WhatsApp",
-          surname: "Lead",
-          full_name: null,
+          first_name: null,
+          surname: null,
+          full_name: profileName || null,
           phone,
           email: null,
           service_interest: null,
           source: "WhatsApp",
-          status: "Awaiting Full Name",
+          status: "Awaiting First Name",
           notes: incomingText || null,
+          last_message: incomingText || null,
+          last_message_at: new Date().toISOString(),
         })
         .select()
         .single();
 
-      if (error) console.error("LEAD CREATE ERROR:", error);
+      if (createLeadError) {
+        console.error("LEAD CREATE ERROR:", createLeadError);
+      }
 
       lead = newLead;
     }
@@ -142,9 +153,15 @@ export async function POST(req: NextRequest) {
       await supabase
         .from("leads")
         .update({
-          status: "Awaiting Full Name",
+          first_name: null,
+          surname: null,
+          full_name: null,
+          email: null,
           service_interest: null,
+          status: "Awaiting First Name",
           notes: null,
+          last_message: incomingText,
+          last_message_at: new Date().toISOString(),
         })
         .eq("id", lead.id);
 
@@ -154,34 +171,56 @@ export async function POST(req: NextRequest) {
 
 Let's complete your lead form via WhatsApp.
 
-Question 1 of 4:
-What is your full name?`
+Question 1 of 5:
+What is your first name?`
       );
 
       return NextResponse.json({ success: true });
     }
 
-    if (lead.status === "Awaiting Full Name") {
-      const parts = incomingText.split(" ");
-      const firstName = parts[0] || incomingText;
-      const surname = parts.slice(1).join(" ") || "Lead";
-
+    if (lead.status === "Awaiting First Name") {
       await supabase
         .from("leads")
         .update({
-          first_name: firstName,
-          surname,
+          first_name: incomingText,
           full_name: incomingText,
-          status: "Awaiting Email",
+          status: "Awaiting Surname",
+          last_message: incomingText,
+          last_message_at: new Date().toISOString(),
         })
         .eq("id", lead.id);
 
       await sendWhatsAppMessage(
         phone,
-        `Thank you, ${firstName}.
+        `Thank you, ${incomingText}.
 
-Question 2 of 4:
-Please provide your email address.`
+Question 2 of 5:
+What is your surname?`
+      );
+
+      return NextResponse.json({ success: true });
+    }
+
+    if (lead.status === "Awaiting Surname") {
+      const fullName = `${lead.first_name || ""} ${incomingText}`.trim();
+
+      await supabase
+        .from("leads")
+        .update({
+          surname: incomingText,
+          full_name: fullName,
+          status: "Awaiting Email",
+          last_message: incomingText,
+          last_message_at: new Date().toISOString(),
+        })
+        .eq("id", lead.id);
+
+      await sendWhatsAppMessage(
+        phone,
+        `Thank you.
+
+Question 3 of 5:
+What is your email address?`
       );
 
       return NextResponse.json({ success: true });
@@ -193,20 +232,20 @@ Please provide your email address.`
         .update({
           email: incomingText,
           status: "Awaiting Service Interest",
+          last_message: incomingText,
+          last_message_at: new Date().toISOString(),
         })
         .eq("id", lead.id);
 
       await sendWhatsAppMessage(
         phone,
-        `Question 3 of 4:
+        `Question 4 of 5:
 Which service are you interested in?
 
 1. GP Weight Loss Consultation
-2. Medical Cannabis
-3. Longevity Assessment
-4. General Enquiry
+2. GLP-treatment programme
 
-Reply with 1, 2, 3 or 4.`
+Reply with 1 or 2.`
       );
 
       return NextResponse.json({ success: true });
@@ -221,9 +260,7 @@ Reply with 1, 2, 3 or 4.`
           `Please reply with one option:
 
 1. GP Weight Loss Consultation
-2. Medical Cannabis
-3. Longevity Assessment
-4. General Enquiry`
+2. GLP-treatment programme`
         );
 
         return NextResponse.json({ success: true });
@@ -234,6 +271,8 @@ Reply with 1, 2, 3 or 4.`
         .update({
           service_interest: service,
           status: "Awaiting Notes",
+          last_message: incomingText,
+          last_message_at: new Date().toISOString(),
         })
         .eq("id", lead.id);
 
@@ -241,7 +280,7 @@ Reply with 1, 2, 3 or 4.`
         phone,
         `Thank you.
 
-Question 4 of 4:
+Question 5 of 5:
 Please briefly tell us how we can help you.`
       );
 
@@ -271,11 +310,19 @@ A BodyLab consultant will contact you shortly.`
       return NextResponse.json({ success: true });
     }
 
+    await supabase
+      .from("leads")
+      .update({
+        last_message: incomingText,
+        last_message_at: new Date().toISOString(),
+      })
+      .eq("id", lead.id);
+
     await sendWhatsAppMessage(
       phone,
       `Thank you for your message.
 
-To start a new enquiry, please type:
+To start a new BodyLab enquiry, please type:
 
 Register`
     );
