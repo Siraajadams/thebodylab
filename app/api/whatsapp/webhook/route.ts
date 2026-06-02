@@ -24,23 +24,23 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
 
-    // 1. Always store raw webhook event first
-    const { error: webhookError } = await supabase.from("webhook_events").insert({
-      source: "whatsapp",
-      event_type: "messages",
-      raw_payload: body,
-    });
+    // 1. Save raw webhook event
+    const { error: webhookError } = await supabase
+      .from("webhook_events")
+      .insert({
+        source: "whatsapp",
+        event_type: "messages",
+        raw_payload: body,
+      });
 
     if (webhookError) {
       console.error("Webhook event insert error:", webhookError);
     }
 
-    // 2. Extract WhatsApp message
     const value = body?.entry?.[0]?.changes?.[0]?.value;
     const message = value?.messages?.[0];
     const contact = value?.contacts?.[0];
 
-    // If this is not a message event, still return success to Meta
     if (!message) {
       return NextResponse.json({ success: true });
     }
@@ -49,82 +49,93 @@ export async function POST(req: NextRequest) {
     const text = message?.text?.body || "";
     const profileName = contact?.profile?.name || "";
 
-    // 3. Store WhatsApp message if table exists
-    const { error: msgError } = await supabase.from("whatsapp_messages").insert({
-      whatsapp_number: whatsappNumber,
-      profile_name: profileName,
-      message_text: text,
-      raw_payload: body,
-    });
+    // 2. Save WhatsApp message
+    const { error: messageError } = await supabase
+      .from("whatsapp_messages")
+      .insert({
+        phone: whatsappNumber,
+        direction: "inbound",
+        raw_payload: body,
+      });
 
-    if (msgError) {
-      console.error("WhatsApp message insert error:", msgError);
+    if (messageError) {
+      console.error("WhatsApp message insert error:", messageError);
     }
 
-    // 4. Try extract lead fields from message text
-    // Supports:
-    // name: John
-    // surname: Smith
-    // service: GP Weight Loss Consultation
-    //
-    // OR:
-    // John|Smith|0799107059|GP Weight Loss Consultation
-
+    // 3. Extract lead info
     let first_name = "";
     let surname = "";
     let service_interest = "GP Weight Loss Consultation";
 
-    if (text.includes("|")) {
-      const parts = text.split("|").map((p: string) => p.trim());
-      first_name = parts[0] || "";
-      surname = parts[1] || "";
-      service_interest = parts[3] || service_interest;
-    } else {
-      const firstNameMatch = text.match(/name\s*:\s*(.*)/i);
-      const surnameMatch = text.match(/surname\s*:\s*(.*)/i);
-      const serviceMatch = text.match(/service\s*:\s*(.*)/i);
+    const firstNameMatch = text.match(/name\s*:\s*(.*)/i);
+    const surnameMatch = text.match(/surname\s*:\s*(.*)/i);
+    const serviceMatch = text.match(/service\s*:\s*(.*)/i);
 
-      first_name =
-        firstNameMatch?.[1]?.trim() ||
-        profileName.split(" ")[0] ||
-        "";
+    first_name =
+      firstNameMatch?.[1]?.trim() ||
+      profileName.split(" ")[0] ||
+      "WhatsApp";
 
-      surname =
-        surnameMatch?.[1]?.trim() ||
-        profileName.split(" ").slice(1).join(" ") ||
-        "";
+    surname =
+      surnameMatch?.[1]?.trim() ||
+      profileName.split(" ").slice(1).join(" ") ||
+      "Lead";
 
-      service_interest =
-        serviceMatch?.[1]?.trim() ||
-        service_interest;
-    }
+    service_interest =
+      serviceMatch?.[1]?.trim() ||
+      service_interest;
 
-    // 5. Create lead
-    const { error: leadError } = await supabase.from("leads").insert({
-      first_name,
-      surname,
-      full_name: `${first_name} ${surname}`.trim(),
-      phone: whatsappNumber,
-      email: null,
-      service_interest,
-      source: "WhatsApp",
-      notes: text,
-      status: "New Lead",
-    });
+    // 4. Save lead
+    const { error: leadError } = await supabase
+      .from("leads")
+      .insert({
+        first_name,
+        surname,
+        full_name: `${first_name} ${surname}`.trim(),
+        phone: whatsappNumber,
+        email: null,
+        service_interest,
+        source: "WhatsApp",
+        notes: text,
+        status: "New Lead",
+      });
 
     if (leadError) {
       console.error("Lead insert error:", leadError);
     }
 
-    // IMPORTANT: Always return 200 to Meta
+    // 5. Auto-reply to WhatsApp
+    const accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+    const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+
+    if (accessToken && phoneNumberId && whatsappNumber) {
+      await fetch(`https://graph.facebook.com/v25.0/${phoneNumberId}/messages`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          to: whatsappNumber,
+          type: "text",
+          text: {
+            body:
+              "Thank you for contacting BodyLab. Please reply in this format:\n\nName: \nSurname: \nService: GP Weight Loss Consultation",
+          },
+        }),
+      });
+    }
+
+    // Always return 200 to Meta
     return NextResponse.json({ success: true });
   } catch (error: any) {
     console.error("Webhook POST error:", error);
 
-    // Still return 200 so Meta does not keep retrying
+    // Still return 200 so Meta does not keep failing/retrying
     return NextResponse.json({
       success: true,
-      warning: error?.message || "Webhook handled with error",
+      warning: error?.message || "Webhook handled with warning",
     });
   }
 }
