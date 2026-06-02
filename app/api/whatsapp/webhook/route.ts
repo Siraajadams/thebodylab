@@ -1,10 +1,59 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
+export const runtime = "nodejs";
+
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
+
+function splitName(profileName: string) {
+  const clean = profileName?.trim() || "";
+  const parts = clean.split(" ").filter(Boolean);
+
+  return {
+    first_name: parts[0] || "WhatsApp",
+    surname: parts.slice(1).join(" ") || "Lead",
+    full_name: clean || "WhatsApp Lead",
+  };
+}
+
+async function sendWhatsAppReply(to: string) {
+  if (
+    !process.env.WHATSAPP_PHONE_NUMBER_ID ||
+    !process.env.WHATSAPP_ACCESS_TOKEN ||
+    !to
+  ) {
+    console.log("WHATSAPP REPLY SKIPPED: missing env variables or phone");
+    return;
+  }
+
+  const response = await fetch(
+    `https://graph.facebook.com/v25.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to,
+        type: "text",
+        text: {
+          preview_url: false,
+          body:
+            "Thank you for contacting BodyLab. We received your message. A consultant will contact you shortly about the GP Weight Loss Consultation.",
+        },
+      }),
+    }
+  );
+
+  const result = await response.json().catch(() => null);
+  console.log("WHATSAPP REPLY RESULT:", response.status, result);
+}
 
 export async function GET(req: NextRequest) {
   const searchParams = req.nextUrl.searchParams;
@@ -26,124 +75,132 @@ export async function POST(req: NextRequest) {
 
     console.log("WHATSAPP WEBHOOK RECEIVED");
 
-    const { error: webhookError } = await supabase
-      .from("webhook_events")
-      .insert({
-        source: "whatsapp",
-        event_type: "message",
-        raw_payload: body,
-      });
-
-    if (webhookError) {
-      console.error("WEBHOOK EVENT INSERT ERROR:", webhookError);
-    }
+    await supabase.from("webhook_events").insert({
+      source: "whatsapp",
+      event_type: "message",
+      raw_payload: body,
+    });
 
     const value = body?.entry?.[0]?.changes?.[0]?.value;
     const message = value?.messages?.[0];
     const contact = value?.contacts?.[0];
 
     if (!message) {
-      return NextResponse.json({ success: true, note: "No message object" });
+      console.log("NO MESSAGE EVENT - RETURNING SUCCESS");
+      return NextResponse.json({ success: true });
     }
 
     const phone = message?.from || "";
-    const messageText = message?.text?.body || "";
+    const messageText =
+      message?.text?.body ||
+      message?.button?.text ||
+      message?.interactive?.button_reply?.title ||
+      message?.interactive?.list_reply?.title ||
+      "EMPTY";
+
     const profileName = contact?.profile?.name || "";
+    const whatsappMessageId = message?.id || null;
 
-    const nameParts = profileName.trim().split(" ").filter(Boolean);
-    const first_name = nameParts[0] || "WhatsApp";
-    const surname = nameParts.slice(1).join(" ") || "Lead";
-    const full_name = profileName || `${first_name} ${surname}`;
+    const { first_name, surname, full_name } = splitName(profileName);
 
-    const { data: lead, error: leadError } = await supabase
+    console.log("INBOUND WHATSAPP:", {
+      phone,
+      messageText,
+      profileName,
+      whatsappMessageId,
+    });
+
+    const { data: existingLead, error: existingLeadError } = await supabase
       .from("leads")
-      .insert({
+      .select("id")
+      .eq("phone", phone)
+      .maybeSingle();
+
+    if (existingLeadError) {
+      console.error("EXISTING LEAD CHECK ERROR:", JSON.stringify(existingLeadError));
+    }
+
+    let leadId = existingLead?.id || null;
+
+    if (!leadId) {
+      const leadPayload = {
         first_name,
         surname,
         full_name,
         phone,
         email: null,
-        service_interest: "GP Weight Loss Consultation",
+        service_interest:
+          messageText.toLowerCase().includes("weight") ||
+          messageText.toLowerCase().includes("glp")
+            ? "GP Weight Loss Consultation"
+            : "General Enquiry",
         source: "WhatsApp",
         notes: messageText,
         status: "New Lead",
-      })
-      .select("id")
-      .single();
+        whatsapp_id: phone,
+        last_message: messageText,
+        last_message_at: new Date().toISOString(),
+        priority: "Normal",
+      };
 
-    if (leadError) {
-      console.error("LEAD INSERT ERROR:", leadError);
-    }
+      console.log("LEAD PAYLOAD:", leadPayload);
 
-    const { error: whatsappMsgError } = await supabase
-      .from("whatsapp_messages")
-      .insert({
-        lead_id: lead?.id || null,
-        phone,
-        direction: "inbound",
-      });
+      const { data: newLead, error: leadError } = await supabase
+        .from("leads")
+        .insert(leadPayload)
+        .select("id")
+        .single();
 
-    if (whatsappMsgError) {
-      console.error("WHATSAPP MESSAGE INSERT ERROR:", whatsappMsgError);
-    }
-
-    if (lead?.id) {
-      const { error: activityError } = await supabase
-        .from("activities")
-        .insert({
-          lead_id: lead.id,
-          activity: "WhatsApp lead created",
-          activity_type: "lead_created",
-        });
-
-      if (activityError) {
-        console.error("ACTIVITY INSERT ERROR:", activityError);
-      }
-    }
-
-    if (
-      process.env.WHATSAPP_PHONE_NUMBER_ID &&
-      process.env.WHATSAPP_ACCESS_TOKEN &&
-      phone
-    ) {
-      const metaResponse = await fetch(
-        `https://graph.facebook.com/v25.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            messaging_product: "whatsapp",
-            recipient_type: "individual",
-            to: phone,
-            type: "text",
-            text: {
-              preview_url: false,
-              body:
-                "Thank you for contacting BodyLab. We received your message. A consultant will contact you shortly about the GP Weight Loss Consultation.",
-            },
-          }),
-        }
-      );
-
-      const metaResult = await metaResponse.json();
-
-      if (!metaResponse.ok) {
-        console.error("GRAPH API ERROR:", metaResult);
+      if (leadError) {
+        console.error("LEAD INSERT ERROR:", JSON.stringify(leadError));
       } else {
-        console.log("WHATSAPP REPLY SENT:", metaResult);
+        leadId = newLead?.id || null;
+        console.log("LEAD CREATED:", newLead);
+      }
+    } else {
+      const { error: updateLeadError } = await supabase
+        .from("leads")
+        .update({
+          notes: messageText,
+          last_message: messageText,
+          last_message_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", leadId);
+
+      if (updateLeadError) {
+        console.error("LEAD UPDATE ERROR:", JSON.stringify(updateLeadError));
+      } else {
+        console.log("EXISTING LEAD UPDATED:", leadId);
       }
     }
 
-    return NextResponse.json({ success: true });
-  } catch (error) {
-    console.error("WEBHOOK ERROR:", error);
+    await supabase.from("whatsapp_messages").insert({
+      lead_id: leadId,
+      phone,
+      direction: "inbound",
+      message_text: messageText,
+      whatsapp_message_id: whatsappMessageId,
+      raw_payload: body,
+    });
+
+    if (leadId) {
+      await supabase.from("activities").insert({
+        lead_id: leadId,
+        activity: `WhatsApp message received: ${messageText}`,
+        activity_type: "whatsapp_message",
+      });
+    }
+
+    await sendWhatsAppReply(phone);
+
+    return NextResponse.json({ success: true, lead_id: leadId });
+  } catch (error: any) {
+    console.error("WEBHOOK ERROR:", error?.message || error);
 
     return NextResponse.json({
       success: true,
-      warning: String(error),
+      warning: error?.message || String(error),
     });
   }
 }
