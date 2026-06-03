@@ -12,13 +12,13 @@ const supabase = createClient(
 );
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "bodylab_verify_token";
-const WHATSAPP_TOKEN =
-  process.env.WHATSAPP_ACCESS_TOKEN || process.env.META_ACCESS_TOKEN || "";
+const WHATSAPP_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN || "";
 const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || "";
 
 type LeadStep =
   | "first_name"
   | "surname"
+  | "email"
   | "service"
   | "notes"
   | "completed";
@@ -32,14 +32,6 @@ function normalisePhone(phone: string) {
 }
 
 async function sendWhatsAppMessage(phone: string, message: string) {
-  if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
-    console.error("Missing WhatsApp env vars", {
-      hasToken: !!WHATSAPP_TOKEN,
-      hasPhoneNumberId: !!PHONE_NUMBER_ID,
-    });
-    return;
-  }
-
   const response = await fetch(
     `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`,
     {
@@ -61,45 +53,27 @@ async function sendWhatsAppMessage(phone: string, message: string) {
   );
 
   const result = await response.json().catch(() => null);
-
   console.log("META RESPONSE:", result);
 
-  if (!response.ok) {
-    console.error("META SEND ERROR:", result);
-  }
+  if (!response.ok) console.error("META SEND ERROR:", result);
 
   return result;
 }
 
-async function saveIncomingMessage(phone: string, message: string) {
+async function saveMessage(phone: string, messageText: string, direction: string) {
   const { error } = await supabase.from("whatsapp_messages").insert({
     phone,
-    direction: "inbound",
-    message,
+    message_text: messageText,
+    direction,
     created_at: new Date().toISOString(),
   });
 
-  if (error) {
-    console.error("WHATSAPP MESSAGE SAVE ERROR:", error);
-  }
-}
-
-async function saveOutboundMessage(phone: string, message: string) {
-  const { error } = await supabase.from("whatsapp_messages").insert({
-    phone,
-    direction: "outbound",
-    message,
-    created_at: new Date().toISOString(),
-  });
-
-  if (error) {
-    console.error("OUTBOUND MESSAGE SAVE ERROR:", error);
-  }
+  if (error) console.error("WHATSAPP MESSAGE SAVE ERROR:", error);
 }
 
 async function reply(phone: string, message: string) {
   await sendWhatsAppMessage(phone, message);
-  await saveOutboundMessage(phone, message);
+  await saveMessage(phone, message, "outbound");
 }
 
 async function getSession(phone: string) {
@@ -109,19 +83,12 @@ async function getSession(phone: string) {
     .eq("phone", phone)
     .maybeSingle();
 
-  if (error) {
-    console.error("GET SESSION ERROR:", error);
-  }
-
+  if (error) console.error("GET SESSION ERROR:", error);
   return data;
 }
 
 async function upsertSession(phone: string, updates: any) {
-  const { data: existing } = await supabase
-    .from("whatsapp_lead_sessions")
-    .select("*")
-    .eq("phone", phone)
-    .maybeSingle();
+  const existing = await getSession(phone);
 
   const payload = {
     phone,
@@ -129,87 +96,72 @@ async function upsertSession(phone: string, updates: any) {
     updated_at: new Date().toISOString(),
   };
 
-  let result;
+  const result = existing
+    ? await supabase
+        .from("whatsapp_lead_sessions")
+        .update(payload)
+        .eq("phone", phone)
+        .select()
+        .single()
+    : await supabase
+        .from("whatsapp_lead_sessions")
+        .insert({
+          ...payload,
+          created_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
 
-  if (existing) {
-    result = await supabase
-      .from("whatsapp_lead_sessions")
-      .update(payload)
-      .eq("phone", phone)
-      .select()
-      .single();
-  } else {
-    result = await supabase
-      .from("whatsapp_lead_sessions")
-      .insert({
-        ...payload,
-        created_at: new Date().toISOString(),
-      })
-      .select()
-      .single();
-  }
-
-  if (result.error) {
-    console.error("UPSERT SESSION ERROR:", result.error);
-  }
+  if (result.error) console.error("UPSERT SESSION ERROR:", result.error);
 
   return result.data;
 }
 
 async function upsertLead(phone: string, updates: any) {
-  const { data: existing } = await supabase
+  const { data: existing, error: findError } = await supabase
     .from("leads")
     .select("*")
     .eq("phone", phone)
     .maybeSingle();
 
+  if (findError) console.error("FIND LEAD ERROR:", findError);
+
   const payload = {
     phone,
+    source: "WhatsApp",
     ...updates,
     last_message_at: new Date().toISOString(),
   };
 
-  let result;
+  const result = existing
+    ? await supabase
+        .from("leads")
+        .update(payload)
+        .eq("phone", phone)
+        .select()
+        .single()
+    : await supabase
+        .from("leads")
+        .insert({
+          ...payload,
+          created_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
 
-  if (existing) {
-    result = await supabase
-      .from("leads")
-      .update(payload)
-      .eq("phone", phone)
-      .select()
-      .single();
-  } else {
-    result = await supabase
-      .from("leads")
-      .insert({
-        ...payload,
-        source: "WhatsApp",
-        status: updates.status || "WhatsApp lead",
-        created_at: new Date().toISOString(),
-      })
-      .select()
-      .single();
-  }
-
-  if (result.error) {
-    console.error("UPSERT LEAD ERROR:", result.error);
-  }
+  if (result.error) console.error("UPSERT LEAD ERROR:", result.error);
 
   return result.data;
 }
 
-function serviceText(input: string) {
-  const value = cleanText(input).toLowerCase();
+function getService(input: string) {
+  const value = input.toLowerCase();
 
   if (value === "1" || value.includes("gp")) {
     return "GP Weight Loss Consultation";
   }
 
-  if (
-    value === "2" ||
-    value.includes("glp") ||
-    value.includes("treatment")
-  ) {
+  if (value === "2" || value.includes("glp")) {
     return "GLP-treatment programme";
   }
 
@@ -232,10 +184,17 @@ Question 2 of 5:
 What is your surname?`;
 }
 
-function serviceMessage() {
+function emailMessage() {
   return `Thank you.
 
 Question 3 of 5:
+What is your email address?`;
+}
+
+function serviceMessage() {
+  return `Thank you.
+
+Question 4 of 5:
 Which service are you interested in?
 
 1. GP Weight Loss Consultation
@@ -247,7 +206,7 @@ Reply with 1 or 2.`;
 function notesMessage() {
   return `Thank you.
 
-Question 4 of 5:
+Question 5 of 5:
 Please briefly tell us how we can help you.`;
 }
 
@@ -259,7 +218,6 @@ Your lead form has been completed successfully.
 A BodyLab consultant will contact you shortly.`;
 }
 
-// Meta webhook verification
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
 
@@ -274,7 +232,6 @@ export async function GET(req: NextRequest) {
   return NextResponse.json({ error: "Verification failed" }, { status: 403 });
 }
 
-// WhatsApp incoming webhook
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
@@ -292,10 +249,10 @@ export async function POST(req: NextRequest) {
     const incomingText = cleanText(messageObj?.text?.body);
 
     if (!phone || !incomingText) {
-      return NextResponse.json({ success: true, message: "No text message" });
+      return NextResponse.json({ success: true, message: "No text" });
     }
 
-    await saveIncomingMessage(phone, incomingText);
+    await saveMessage(phone, incomingText, "inbound");
 
     let session = await getSession(phone);
 
@@ -307,6 +264,7 @@ export async function POST(req: NextRequest) {
         step: "first_name",
         first_name: null,
         surname: null,
+        email: null,
         service_interest: null,
         notes: null,
       });
@@ -317,57 +275,66 @@ export async function POST(req: NextRequest) {
       });
 
       await reply(phone, startMessage());
-
       return NextResponse.json({ success: true });
     }
 
     const step = session.step as LeadStep;
 
     if (step === "first_name") {
-      const firstName = incomingText;
-
       await upsertSession(phone, {
         step: "surname",
-        first_name: firstName,
+        first_name: incomingText,
       });
 
       await upsertLead(phone, {
-        first_name: firstName,
-        full_name: firstName,
+        first_name: incomingText,
+        full_name: incomingText,
         status: "Awaiting surname",
         last_message: incomingText,
       });
 
       await reply(phone, surnameMessage());
-
       return NextResponse.json({ success: true });
     }
 
     if (step === "surname") {
-      const surname = incomingText;
-      const firstName = session.first_name || "";
-      const fullName = `${firstName} ${surname}`.trim();
+      const fullName = `${session.first_name || ""} ${incomingText}`.trim();
 
       await upsertSession(phone, {
-        step: "service",
-        surname,
+        step: "email",
+        surname: incomingText,
       });
 
       await upsertLead(phone, {
-        first_name: firstName,
-        surname,
+        first_name: session.first_name,
+        surname: incomingText,
         full_name: fullName,
+        status: "Awaiting email",
+        last_message: incomingText,
+      });
+
+      await reply(phone, emailMessage());
+      return NextResponse.json({ success: true });
+    }
+
+    if (step === "email") {
+      await upsertSession(phone, {
+        step: "service",
+        email: incomingText,
+      });
+
+      await upsertLead(phone, {
+        email: incomingText,
         status: "Awaiting service",
         last_message: incomingText,
       });
 
       await reply(phone, serviceMessage());
-
       return NextResponse.json({ success: true });
     }
 
     if (step === "service") {
-      const selectedService = serviceText(incomingText);
+      const selectedService = getService(incomingText);
 
       if (!selectedService) {
         await reply(
@@ -377,7 +344,6 @@ export async function POST(req: NextRequest) {
 1. GP Weight Loss Consultation
 2. GLP-treatment programme`
         );
-
         return NextResponse.json({ success: true });
       }
 
@@ -393,39 +359,33 @@ export async function POST(req: NextRequest) {
       });
 
       await reply(phone, notesMessage());
-
       return NextResponse.json({ success: true });
     }
 
     if (step === "notes") {
-      const notes = incomingText;
+      const fullName = `${session.first_name || ""} ${session.surname || ""}`.trim();
 
       await upsertSession(phone, {
         step: "completed",
-        notes,
+        notes: incomingText,
       });
 
-      const firstName = session.first_name || "";
-      const surname = session.surname || "";
-      const fullName = `${firstName} ${surname}`.trim();
-
       await upsertLead(phone, {
-        first_name: firstName,
-        surname,
+        first_name: session.first_name,
+        surname: session.surname,
         full_name: fullName,
+        email: session.email,
         service_interest: session.service_interest,
-        notes,
+        notes: incomingText,
         status: "Completed",
         last_message: incomingText,
       });
 
       await reply(phone, finalMessage());
-
       return NextResponse.json({ success: true });
     }
 
     await reply(phone, startMessage());
-
     return NextResponse.json({ success: true });
   } catch (error) {
     console.error("WHATSAPP WEBHOOK ERROR:", error);
