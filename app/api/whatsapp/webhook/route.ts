@@ -31,9 +31,14 @@ function normalisePhone(phone: string) {
   return cleanText(phone).replace(/\D/g, "");
 }
 
-function isRestartCommand(text: string) {
+function isStartCommand(text: string) {
   const value = cleanText(text).toLowerCase();
-  return ["hi", "hello", "start", "restart", "reset", "good day", "goodday"].includes(value);
+  return ["hi", "hello", "start", "good day", "goodday"].includes(value);
+}
+
+function isResetCommand(text: string) {
+  const value = cleanText(text).toLowerCase();
+  return ["reset", "restart"].includes(value);
 }
 
 async function saveWebhookEvent(body: any) {
@@ -326,9 +331,31 @@ export async function POST(req: NextRequest) {
     }
 
     let session = await getSession(phone);
-    const wantsRestart = isRestartCommand(incomingText);
+    const wantsStart = isStartCommand(incomingText);
+    const wantsReset = isResetCommand(incomingText);
 
-    if (!session || session.step === "completed" || wantsRestart) {
+    if (wantsReset) {
+      const newLead = await createNewLead(phone, incomingText);
+      const leadId = newLead?.id || null;
+
+      await saveMessage(phone, incomingText, "inbound", leadId);
+
+      await upsertSession(phone, {
+        lead_id: leadId,
+        step: "first_name",
+        first_name: null,
+        surname: null,
+        email: null,
+        service_interest: null,
+        notes: null,
+        completed: false,
+      });
+
+      await reply(phone, startMessage(), leadId);
+      return NextResponse.json({ success: true });
+    }
+
+    if (!session || session.step === "completed") {
       const newLead = await createNewLead(phone, incomingText);
       const leadId = newLead?.id || null;
 
@@ -350,6 +377,20 @@ export async function POST(req: NextRequest) {
     }
 
     const leadId = session.lead_id || null;
+
+    if (wantsStart) {
+      await saveMessage(phone, incomingText, "inbound", leadId);
+
+      await reply(
+        phone,
+        `You already have an active lead form in progress.
+
+Please answer the current question, or type RESET to start again.`,
+        leadId
+      );
+
+      return NextResponse.json({ success: true });
+    }
 
     await saveMessage(phone, incomingText, "inbound", leadId);
 
