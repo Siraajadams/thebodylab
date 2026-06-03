@@ -233,10 +233,14 @@ Question 5 of 5:
 Please briefly tell us how we can help you.`;
 }
 
-function finalMessage() {
+function finalMessage(fullName: string, email: string, service: string) {
   return `✅ Thank you.
 
 Your lead form has been completed successfully.
+
+Name: ${fullName}
+Email: ${email}
+Service: ${service}
 
 A BodyLab consultant will contact you shortly.`;
 }
@@ -293,6 +297,8 @@ export async function POST(req: NextRequest) {
       });
 
       await upsertLead(phone, {
+        phone,
+        source: "WhatsApp",
         status: "Awaiting first name",
         last_message: incomingText,
       });
@@ -310,9 +316,11 @@ export async function POST(req: NextRequest) {
       });
 
       await upsertLead(phone, {
+        phone,
         first_name: incomingText,
         full_name: incomingText,
         status: "Awaiting surname",
+        source: "WhatsApp",
         last_message: incomingText,
       });
 
@@ -331,10 +339,12 @@ export async function POST(req: NextRequest) {
       });
 
       await upsertLead(phone, {
+        phone,
         first_name: firstName,
         surname,
         full_name: fullName,
         status: "Awaiting email",
+        source: "WhatsApp",
         last_message: incomingText,
       });
 
@@ -349,8 +359,10 @@ export async function POST(req: NextRequest) {
       });
 
       await upsertLead(phone, {
+        phone,
         email: incomingText,
         status: "Awaiting service",
+        source: "WhatsApp",
         last_message: incomingText,
       });
 
@@ -379,8 +391,10 @@ export async function POST(req: NextRequest) {
       });
 
       await upsertLead(phone, {
+        phone,
         service_interest: selectedService,
         status: "Awaiting notes",
+        source: "WhatsApp",
         last_message: incomingText,
       });
 
@@ -396,16 +410,41 @@ export async function POST(req: NextRequest) {
       const notes = incomingText;
       const fullName = `${firstName} ${surname}`.trim();
 
-      await upsertLead(phone, {
-        first_name: firstName,
-        surname,
-        full_name: fullName,
-        email,
-        service_interest: serviceInterest,
-        notes,
-        status: "New",
-        last_message: notes,
-      });
+      const { error: leadUpdateError } = await supabase
+        .from("leads")
+        .update({
+          first_name: firstName,
+          surname,
+          full_name: fullName,
+          email,
+          phone,
+          service_interest: serviceInterest,
+          notes,
+          status: "New",
+          source: "WhatsApp",
+          last_message: notes,
+          last_message_at: new Date().toISOString(),
+        })
+        .eq("phone", phone);
+
+      if (leadUpdateError) {
+        console.error("FINAL LEAD UPDATE ERROR:", leadUpdateError);
+
+        await upsertLead(phone, {
+          phone,
+          first_name: firstName,
+          surname,
+          full_name: fullName,
+          email,
+          service_interest: serviceInterest,
+          notes,
+          status: "New",
+          source: "WhatsApp",
+          last_message: notes,
+        });
+      } else {
+        console.log("FINAL LEAD UPDATED SUCCESSFULLY:", phone);
+      }
 
       await upsertSession(phone, {
         step: "completed",
@@ -417,7 +456,7 @@ export async function POST(req: NextRequest) {
         completed: true,
       });
 
-      await reply(phone, finalMessage());
+      await reply(phone, finalMessage(fullName, email, serviceInterest));
       return NextResponse.json({ success: true });
     }
 
