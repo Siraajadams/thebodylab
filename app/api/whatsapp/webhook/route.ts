@@ -31,7 +31,44 @@ function normalisePhone(phone: string) {
   return cleanText(phone).replace(/\D/g, "");
 }
 
+function isRestartCommand(text: string) {
+  const value = cleanText(text).toLowerCase();
+  return ["hi", "hello", "start", "restart", "reset", "good day", "goodday"].includes(value);
+}
+
+async function saveWebhookEvent(body: any) {
+  const value = body?.entry?.[0]?.changes?.[0]?.value;
+  const field = body?.entry?.[0]?.changes?.[0]?.field;
+
+  const { error } = await supabase.from("webhook_events").insert({
+    source: "whatsapp",
+    event_type: field || "message",
+    raw_payload: body,
+    processed: false,
+    created_at: new Date().toISOString(),
+  });
+
+  if (error) console.error("WEBHOOK EVENT SAVE ERROR:", error);
+
+  if (field === "leadgen" || value?.leadgen_id || value?.form_id) {
+    const { error: metaError } = await supabase.from("meta_lead_events").insert({
+      meta_lead_id: value?.leadgen_id || value?.id || null,
+      page_id: value?.page_id || null,
+      form_id: value?.form_id || null,
+      raw_payload: body,
+      created_at: new Date().toISOString(),
+    });
+
+    if (metaError) console.error("META LEAD EVENT SAVE ERROR:", metaError);
+  }
+}
+
 async function sendWhatsAppMessage(phone: string, message: string) {
+  if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
+    console.error("WHATSAPP TOKEN OR PHONE_NUMBER_ID MISSING");
+    return null;
+  }
+
   const response = await fetch(
     `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`,
     {
@@ -73,6 +110,7 @@ async function saveMessage(
     lead_id: leadId || null,
     message_text: messageText,
     direction,
+    raw_payload: null,
     created_at: new Date().toISOString(),
   });
 
@@ -131,21 +169,32 @@ async function upsertSession(phone: string, updates: any) {
 
 async function createNewLead(phone: string, incomingText: string) {
   const cleanedPhone = normalisePhone(phone);
+  const leadReference =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random()}`;
 
   const { data, error } = await supabase
     .from("leads")
     .insert({
       phone: cleanedPhone,
+      whatsapp_id: cleanedPhone,
+      lead_reference: leadReference,
       source: "WhatsApp",
       status: "In Progress",
+      priority: "Normal",
       last_message: incomingText,
       last_message_at: new Date().toISOString(),
       created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
     })
-    .select()
+    .select("id")
     .single();
 
-  if (error) console.error("CREATE NEW LEAD ERROR:", error);
+  if (error) {
+    console.error("CREATE NEW LEAD ERROR:", error);
+    return null;
+  }
 
   return data;
 }
@@ -160,6 +209,7 @@ async function updateLeadById(leadId: string | null, updates: any) {
     .from("leads")
     .update({
       ...updates,
+      updated_at: new Date().toISOString(),
       last_message_at: new Date().toISOString(),
     })
     .eq("id", leadId)
@@ -247,7 +297,7 @@ export async function GET(req: NextRequest) {
   const challenge = searchParams.get("hub.challenge");
 
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    return new NextResponse(challenge, { status: 200 });
+    return new NextResponse(challenge || "", { status: 200 });
   }
 
   return NextResponse.json({ error: "Verification failed" }, { status: 403 });
@@ -258,6 +308,8 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
 
     console.log("WHATSAPP WEBHOOK RECEIVED:", JSON.stringify(body));
+
+    await saveWebhookEvent(body);
 
     const value = body?.entry?.[0]?.changes?.[0]?.value;
     const messageObj = value?.messages?.[0];
@@ -273,10 +325,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: true, message: "No text" });
     }
 
-    const restartWords = ["hi", "hello", "start", "restart", "reset", "good day", "goodday"];
-    const wantsRestart = restartWords.includes(incomingText.toLowerCase());
-
     let session = await getSession(phone);
+    const wantsRestart = isRestartCommand(incomingText);
 
     if (!session || session.step === "completed" || wantsRestart) {
       const newLead = await createNewLead(phone, incomingText);
@@ -319,6 +369,7 @@ export async function POST(req: NextRequest) {
         status: "In Progress",
         source: "WhatsApp",
         phone,
+        whatsapp_id: phone,
         last_message: incomingText,
       });
 
@@ -345,6 +396,7 @@ export async function POST(req: NextRequest) {
         status: "In Progress",
         source: "WhatsApp",
         phone,
+        whatsapp_id: phone,
         last_message: incomingText,
       });
 
@@ -365,6 +417,7 @@ export async function POST(req: NextRequest) {
         status: "In Progress",
         source: "WhatsApp",
         phone,
+        whatsapp_id: phone,
         last_message: incomingText,
       });
 
@@ -400,6 +453,7 @@ export async function POST(req: NextRequest) {
         status: "In Progress",
         source: "WhatsApp",
         phone,
+        whatsapp_id: phone,
         last_message: incomingText,
       });
 
@@ -421,10 +475,12 @@ export async function POST(req: NextRequest) {
         full_name: fullName,
         email,
         phone,
+        whatsapp_id: phone,
         service_interest: serviceInterest,
         notes,
-        status: "New",
+        status: "New Lead",
         source: "WhatsApp",
+        priority: "Normal",
         last_message: notes,
       });
 
