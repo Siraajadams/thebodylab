@@ -287,7 +287,7 @@ export async function POST(req: NextRequest) {
     const restartWords = ["hi", "hello", "start", "restart", "reset"];
     const wantsRestart = restartWords.includes(incomingText.toLowerCase());
 
-    if (!session || wantsRestart || session.step === "completed") {
+    if (!session || (wantsRestart && session.step === "completed")) {
       const newLead = await createNewLead(phone, incomingText);
       const leadId = newLead?.id || null;
 
