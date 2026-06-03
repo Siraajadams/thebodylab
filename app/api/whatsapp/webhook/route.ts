@@ -62,9 +62,15 @@ async function sendWhatsAppMessage(phone: string, message: string) {
   return result;
 }
 
-async function saveMessage(phone: string, messageText: string, direction: string) {
+async function saveMessage(
+  phone: string,
+  messageText: string,
+  direction: string,
+  leadId?: string | null
+) {
   const { error } = await supabase.from("whatsapp_messages").insert({
     phone,
+    lead_id: leadId || null,
     message_text: messageText,
     direction,
     created_at: new Date().toISOString(),
@@ -75,9 +81,9 @@ async function saveMessage(phone: string, messageText: string, direction: string
   }
 }
 
-async function reply(phone: string, message: string) {
+async function reply(phone: string, message: string, leadId?: string | null) {
   await sendWhatsAppMessage(phone, message);
-  await saveMessage(phone, message, "outbound");
+  await saveMessage(phone, message, "outbound", leadId);
 }
 
 async function getSession(phone: string) {
@@ -124,57 +130,55 @@ async function upsertSession(phone: string, updates: any) {
 
   if (result.error) {
     console.error("UPSERT SESSION ERROR:", result.error);
-  } else {
-    console.log("SESSION SAVED SUCCESSFULLY:", result.data);
   }
 
   return result.data;
 }
 
-async function upsertLead(phone: string, updates: any) {
+async function createNewLead(phone: string, incomingText: string) {
   const cleanedPhone = normalisePhone(phone);
 
-  const payload = {
-    phone: cleanedPhone,
-    source: "WhatsApp",
-    ...updates,
-    last_message_at: new Date().toISOString(),
-  };
-
-  const { data: existing, error: findError } = await supabase
+  const { data, error } = await supabase
     .from("leads")
-    .select("*")
-    .eq("phone", cleanedPhone)
-    .maybeSingle();
+    .insert({
+      phone: cleanedPhone,
+      source: "WhatsApp",
+      status: "In Progress",
+      last_message: incomingText,
+      last_message_at: new Date().toISOString(),
+      created_at: new Date().toISOString(),
+    })
+    .select()
+    .single();
 
-  if (findError) {
-    console.error("FIND LEAD ERROR:", findError);
+  if (error) {
+    console.error("CREATE NEW LEAD ERROR:", error);
   }
 
-  const result = existing
-    ? await supabase
-        .from("leads")
-        .update(payload)
-        .eq("phone", cleanedPhone)
-        .select()
-        .single()
-    : await supabase
-        .from("leads")
-        .insert({
-          ...payload,
-          status: updates.status || "New",
-          created_at: new Date().toISOString(),
-        })
-        .select()
-        .single();
+  return data;
+}
 
-  if (result.error) {
-    console.error("UPSERT LEAD ERROR:", result.error);
-  } else {
-    console.log("LEAD SAVED SUCCESSFULLY:", result.data);
+async function updateLeadById(leadId: string | null, updates: any) {
+  if (!leadId) {
+    console.error("NO LEAD ID PROVIDED FOR UPDATE");
+    return null;
   }
 
-  return result.data;
+  const { data, error } = await supabase
+    .from("leads")
+    .update({
+      ...updates,
+      last_message_at: new Date().toISOString(),
+    })
+    .eq("id", leadId)
+    .select()
+    .single();
+
+  if (error) {
+    console.error("UPDATE LEAD BY ID ERROR:", error);
+  }
+
+  return data;
 }
 
 function getService(input: string) {
@@ -279,14 +283,18 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: true, message: "No text" });
     }
 
-    await saveMessage(phone, incomingText, "inbound");
-
     const session = await getSession(phone);
     const restartWords = ["hi", "hello", "start", "restart", "reset"];
     const wantsRestart = restartWords.includes(incomingText.toLowerCase());
 
     if (!session || wantsRestart || session.step === "completed") {
+      const newLead = await createNewLead(phone, incomingText);
+      const leadId = newLead?.id || null;
+
+      await saveMessage(phone, incomingText, "inbound", leadId);
+
       await upsertSession(phone, {
+        lead_id: leadId,
         step: "first_name",
         first_name: null,
         surname: null,
@@ -296,16 +304,13 @@ export async function POST(req: NextRequest) {
         completed: false,
       });
 
-      await upsertLead(phone, {
-        phone,
-        source: "WhatsApp",
-        status: "Awaiting first name",
-        last_message: incomingText,
-      });
-
-      await reply(phone, startMessage());
+      await reply(phone, startMessage(), leadId);
       return NextResponse.json({ success: true });
     }
+
+    const leadId = session.lead_id || null;
+
+    await saveMessage(phone, incomingText, "inbound", leadId);
 
     const step = session.step as LeadStep;
 
@@ -315,16 +320,14 @@ export async function POST(req: NextRequest) {
         first_name: incomingText,
       });
 
-      await upsertLead(phone, {
-        phone,
+      await updateLeadById(leadId, {
         first_name: incomingText,
         full_name: incomingText,
-        status: "Awaiting surname",
-        source: "WhatsApp",
+        status: "In Progress",
         last_message: incomingText,
       });
 
-      await reply(phone, surnameMessage());
+      await reply(phone, surnameMessage(), leadId);
       return NextResponse.json({ success: true });
     }
 
@@ -338,17 +341,15 @@ export async function POST(req: NextRequest) {
         surname,
       });
 
-      await upsertLead(phone, {
-        phone,
+      await updateLeadById(leadId, {
         first_name: firstName,
         surname,
         full_name: fullName,
-        status: "Awaiting email",
-        source: "WhatsApp",
+        status: "In Progress",
         last_message: incomingText,
       });
 
-      await reply(phone, emailMessage());
+      await reply(phone, emailMessage(), leadId);
       return NextResponse.json({ success: true });
     }
 
@@ -358,15 +359,13 @@ export async function POST(req: NextRequest) {
         email: incomingText,
       });
 
-      await upsertLead(phone, {
-        phone,
+      await updateLeadById(leadId, {
         email: incomingText,
-        status: "Awaiting service",
-        source: "WhatsApp",
+        status: "In Progress",
         last_message: incomingText,
       });
 
-      await reply(phone, serviceMessage());
+      await reply(phone, serviceMessage(), leadId);
       return NextResponse.json({ success: true });
     }
 
@@ -379,7 +378,8 @@ export async function POST(req: NextRequest) {
           `Please reply with one option:
 
 1. GP Weight Loss Consultation
-2. GLP-treatment programme`
+2. GLP-treatment programme`,
+          leadId
         );
 
         return NextResponse.json({ success: true });
@@ -390,15 +390,13 @@ export async function POST(req: NextRequest) {
         service_interest: selectedService,
       });
 
-      await upsertLead(phone, {
-        phone,
+      await updateLeadById(leadId, {
         service_interest: selectedService,
-        status: "Awaiting notes",
-        source: "WhatsApp",
+        status: "In Progress",
         last_message: incomingText,
       });
 
-      await reply(phone, notesMessage());
+      await reply(phone, notesMessage(), leadId);
       return NextResponse.json({ success: true });
     }
 
@@ -410,41 +408,18 @@ export async function POST(req: NextRequest) {
       const notes = incomingText;
       const fullName = `${firstName} ${surname}`.trim();
 
-      const { error: leadUpdateError } = await supabase
-        .from("leads")
-        .update({
-          first_name: firstName,
-          surname,
-          full_name: fullName,
-          email,
-          phone,
-          service_interest: serviceInterest,
-          notes,
-          status: "New",
-          source: "WhatsApp",
-          last_message: notes,
-          last_message_at: new Date().toISOString(),
-        })
-        .eq("phone", phone);
-
-      if (leadUpdateError) {
-        console.error("FINAL LEAD UPDATE ERROR:", leadUpdateError);
-
-        await upsertLead(phone, {
-          phone,
-          first_name: firstName,
-          surname,
-          full_name: fullName,
-          email,
-          service_interest: serviceInterest,
-          notes,
-          status: "New",
-          source: "WhatsApp",
-          last_message: notes,
-        });
-      } else {
-        console.log("FINAL LEAD UPDATED SUCCESSFULLY:", phone);
-      }
+      await updateLeadById(leadId, {
+        first_name: firstName,
+        surname,
+        full_name: fullName,
+        email,
+        phone,
+        service_interest: serviceInterest,
+        notes,
+        status: "New",
+        source: "WhatsApp",
+        last_message: notes,
+      });
 
       await upsertSession(phone, {
         step: "completed",
@@ -456,11 +431,11 @@ export async function POST(req: NextRequest) {
         completed: true,
       });
 
-      await reply(phone, finalMessage(fullName, email, serviceInterest));
+      await reply(phone, finalMessage(fullName, email, serviceInterest), leadId);
       return NextResponse.json({ success: true });
     }
 
-    await reply(phone, startMessage());
+    await reply(phone, startMessage(), leadId);
     return NextResponse.json({ success: true });
   } catch (error) {
     console.error("WHATSAPP WEBHOOK ERROR:", error);
