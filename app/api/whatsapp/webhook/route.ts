@@ -284,10 +284,52 @@ export async function POST(req: NextRequest) {
     }
 
     const session = await getSession(phone);
-    const restartWords = ["hi", "hello", "start", "restart", "reset"];
-    const wantsRestart = restartWords.includes(incomingText.toLowerCase());
+const restartWords = ["hi", "hello", "start", "restart", "reset"];
+const wantsRestart = restartWords.includes(incomingText.toLowerCase());
 
-    if (!session || (wantsRestart && session.step === "completed")) {
+if (!session || session.step === "completed") {
+  const newLead = await createNewLead(phone, incomingText);
+  const leadId = newLead?.id || null;
+
+  await saveMessage(phone, incomingText, "inbound", leadId);
+
+  if (wantsRestart) {
+    await upsertSession(phone, {
+      lead_id: leadId,
+      step: "first_name",
+      first_name: null,
+      surname: null,
+      email: null,
+      service_interest: null,
+      notes: null,
+      completed: false,
+    });
+
+    await reply(phone, startMessage(), leadId);
+    return NextResponse.json({ success: true });
+  }
+
+  await upsertSession(phone, {
+    lead_id: leadId,
+    step: "surname",
+    first_name: incomingText,
+    surname: null,
+    email: null,
+    service_interest: null,
+    notes: null,
+    completed: false,
+  });
+
+  await updateLeadById(leadId, {
+    first_name: incomingText,
+    full_name: incomingText,
+    status: "In Progress",
+    last_message: incomingText,
+  });
+
+  await reply(phone, surnameMessage(), leadId);
+  return NextResponse.json({ success: true });
+}
       const newLead = await createNewLead(phone, incomingText);
       const leadId = newLead?.id || null;
 
