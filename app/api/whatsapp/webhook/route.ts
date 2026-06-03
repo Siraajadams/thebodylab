@@ -76,9 +76,7 @@ async function saveMessage(
     created_at: new Date().toISOString(),
   });
 
-  if (error) {
-    console.error("WHATSAPP MESSAGE SAVE ERROR:", error);
-  }
+  if (error) console.error("WHATSAPP MESSAGE SAVE ERROR:", error);
 }
 
 async function reply(phone: string, message: string, leadId?: string | null) {
@@ -95,9 +93,7 @@ async function getSession(phone: string) {
     .eq("phone", cleanedPhone)
     .maybeSingle();
 
-  if (error) {
-    console.error("GET SESSION ERROR:", error);
-  }
+  if (error) console.error("GET SESSION ERROR:", error);
 
   return data;
 }
@@ -128,9 +124,7 @@ async function upsertSession(phone: string, updates: any) {
         .select()
         .single();
 
-  if (result.error) {
-    console.error("UPSERT SESSION ERROR:", result.error);
-  }
+  if (result.error) console.error("UPSERT SESSION ERROR:", result.error);
 
   return result.data;
 }
@@ -151,9 +145,7 @@ async function createNewLead(phone: string, incomingText: string) {
     .select()
     .single();
 
-  if (error) {
-    console.error("CREATE NEW LEAD ERROR:", error);
-  }
+  if (error) console.error("CREATE NEW LEAD ERROR:", error);
 
   return data;
 }
@@ -174,9 +166,7 @@ async function updateLeadById(leadId: string | null, updates: any) {
     .select()
     .single();
 
-  if (error) {
-    console.error("UPDATE LEAD BY ID ERROR:", error);
-  }
+  if (error) console.error("UPDATE LEAD BY ID ERROR:", error);
 
   return data;
 }
@@ -283,53 +273,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: true, message: "No text" });
     }
 
-    const session = await getSession(phone);
-const restartWords = ["hi", "hello", "start", "restart", "reset"];
-const wantsRestart = restartWords.includes(incomingText.toLowerCase());
+    const restartWords = ["hi", "hello", "start", "restart", "reset", "good day", "goodday"];
+    const wantsRestart = restartWords.includes(incomingText.toLowerCase());
 
-if (!session || session.step === "completed") {
-  const newLead = await createNewLead(phone, incomingText);
-  const leadId = newLead?.id || null;
+    let session = await getSession(phone);
 
-  await saveMessage(phone, incomingText, "inbound", leadId);
-
-  if (wantsRestart) {
-    await upsertSession(phone, {
-      lead_id: leadId,
-      step: "first_name",
-      first_name: null,
-      surname: null,
-      email: null,
-      service_interest: null,
-      notes: null,
-      completed: false,
-    });
-
-    await reply(phone, startMessage(), leadId);
-    return NextResponse.json({ success: true });
-  }
-
-  await upsertSession(phone, {
-    lead_id: leadId,
-    step: "surname",
-    first_name: incomingText,
-    surname: null,
-    email: null,
-    service_interest: null,
-    notes: null,
-    completed: false,
-  });
-
-  await updateLeadById(leadId, {
-    first_name: incomingText,
-    full_name: incomingText,
-    status: "In Progress",
-    last_message: incomingText,
-  });
-
-  await reply(phone, surnameMessage(), leadId);
-  return NextResponse.json({ success: true });
-}
+    if (!session || session.step === "completed" || wantsRestart) {
       const newLead = await createNewLead(phone, incomingText);
       const leadId = newLead?.id || null;
 
@@ -358,14 +307,18 @@ if (!session || session.step === "completed") {
 
     if (step === "first_name") {
       await upsertSession(phone, {
+        lead_id: leadId,
         step: "surname",
         first_name: incomingText,
+        completed: false,
       });
 
       await updateLeadById(leadId, {
         first_name: incomingText,
         full_name: incomingText,
         status: "In Progress",
+        source: "WhatsApp",
+        phone,
         last_message: incomingText,
       });
 
@@ -379,8 +332,10 @@ if (!session || session.step === "completed") {
       const fullName = `${firstName} ${surname}`.trim();
 
       await upsertSession(phone, {
+        lead_id: leadId,
         step: "email",
         surname,
+        completed: false,
       });
 
       await updateLeadById(leadId, {
@@ -388,6 +343,8 @@ if (!session || session.step === "completed") {
         surname,
         full_name: fullName,
         status: "In Progress",
+        source: "WhatsApp",
+        phone,
         last_message: incomingText,
       });
 
@@ -397,13 +354,17 @@ if (!session || session.step === "completed") {
 
     if (step === "email") {
       await upsertSession(phone, {
+        lead_id: leadId,
         step: "service",
         email: incomingText,
+        completed: false,
       });
 
       await updateLeadById(leadId, {
         email: incomingText,
         status: "In Progress",
+        source: "WhatsApp",
+        phone,
         last_message: incomingText,
       });
 
@@ -428,13 +389,17 @@ if (!session || session.step === "completed") {
       }
 
       await upsertSession(phone, {
+        lead_id: leadId,
         step: "notes",
         service_interest: selectedService,
+        completed: false,
       });
 
       await updateLeadById(leadId, {
         service_interest: selectedService,
         status: "In Progress",
+        source: "WhatsApp",
+        phone,
         last_message: incomingText,
       });
 
@@ -464,6 +429,7 @@ if (!session || session.step === "completed") {
       });
 
       await upsertSession(phone, {
+        lead_id: leadId,
         step: "completed",
         first_name: firstName,
         surname,
