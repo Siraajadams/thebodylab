@@ -1,6 +1,4 @@
-from pathlib import Path
-
-code = r'''// app/api/whatsapp/webhook/route.ts
+// app/api/whatsapp/webhook/route.ts
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -781,8 +779,3 @@ name@gmail.com`,
     );
   }
 }
-'''
-
-path = Path("/mnt/data/route.ts")
-path.write_text(code, encoding="utf-8")
-print(path)
