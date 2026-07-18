@@ -449,7 +449,12 @@ Name: ${fullName}
 Email: ${email}
 Service: ${service}
 
-A BodyLab consultant will contact you shortly.`;
+A BodyLab consultant will contact you shortly.Would you like to book an appointment with one of our doctors now?
+
+Book online:
+https://thebodylab.co.za/
+
+We look forward to helping you achieve your health and weight loss goals.`;
 }
 
 async function beginNewSession(phone: string, incomingText: string, rawPayload: any) {
