@@ -73,8 +73,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const lead =
-      rawLead as unknown as LeadRecord | null;
+    const lead = rawLead as unknown as LeadRecord | null;
 
     if (!lead) {
       return NextResponse.json(
@@ -128,22 +127,24 @@ export async function POST(req: NextRequest) {
 
     const sentAt = new Date().toISOString();
 
+    const messagePayload = {
+      lead_id: lead.id,
+      channel: "email",
+      direction: "outbound",
+      message_type: "email",
+      template_key: templateKey,
+      subject,
+      message_body: message,
+      external_message_id: emailData?.id || null,
+      sender: fromEmail,
+      recipient: leadEmail,
+      delivery_status: "sent",
+      sent_at: sentAt,
+    };
+
     const { error: messageInsertError } = await supabase
       .from("lead_messages")
-      .insert({
-        lead_id: lead.id,
-        channel: "email",
-        direction: "outbound",
-        message_type: "email",
-        template_key: templateKey,
-        subject,
-        message_body: message,
-        external_message_id: emailData?.id || null,
-        sender: fromEmail,
-        recipient: leadEmail,
-        delivery_status: "sent",
-        sent_at: sentAt,
-      });
+      .insert(messagePayload as never);
 
     if (messageInsertError) {
       console.error(
@@ -157,12 +158,14 @@ export async function POST(req: NextRequest) {
         ? "Contacted"
         : lead.status;
 
+    const leadUpdatePayload = {
+      status: nextStatus,
+      updated_at: sentAt,
+    };
+
     const { error: leadUpdateError } = await supabase
       .from("leads")
-      .update({
-        status: nextStatus,
-        updated_at: sentAt,
-      })
+      .update(leadUpdatePayload as never)
       .eq("id", lead.id);
 
     if (leadUpdateError) {
@@ -172,15 +175,17 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const activityPayload = {
+      lead_id: lead.id,
+      activity_type: "email_sent",
+      description: `Email sent to ${
+        lead.first_name || "lead"
+      }.`,
+    };
+
     const { error: activityError } = await supabase
       .from("activities")
-      .insert({
-        lead_id: lead.id,
-        activity_type: "email_sent",
-        description: `Email sent to ${
-          lead.first_name || "lead"
-        }.`,
-      });
+      .insert(activityPayload as never);
 
     if (activityError) {
       console.error(
