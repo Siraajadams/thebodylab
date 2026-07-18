@@ -27,7 +27,8 @@ export async function POST(req: NextRequest) {
     const leadId = String(body.leadId || "").trim();
     const subject = String(body.subject || "").trim();
     const message = String(body.message || "").trim();
-    const templateKey = String(body.templateKey || "").trim() || null;
+    const templateKey =
+      String(body.templateKey || "").trim() || null;
 
     if (!leadId || !subject || !message) {
       return NextResponse.json(
@@ -54,13 +55,11 @@ export async function POST(req: NextRequest) {
     const supabase = getSupabaseAdmin();
     const resend = new Resend(resendApiKey);
 
-    const { data: leadData, error: leadError } = await supabase
+    const { data: rawLead, error: leadError } = await supabase
       .from("leads")
       .select("id, first_name, last_name, email, status")
       .eq("id", leadId)
       .maybeSingle();
-
-    const lead = leadData as LeadRecord | null;
 
     if (leadError) {
       console.error("Lead lookup error:", leadError);
@@ -74,6 +73,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const lead =
+      rawLead as unknown as LeadRecord | null;
+
     if (!lead) {
       return NextResponse.json(
         { error: "Lead not found." },
@@ -81,15 +83,19 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (!lead.email?.trim()) {
+    const leadEmail = String(lead.email || "").trim();
+
+    if (!leadEmail) {
       return NextResponse.json(
-        { error: "The lead does not have an email address." },
+        {
+          error: "The lead does not have an email address.",
+        },
         { status: 400 }
       );
     }
 
-    const leadEmail = lead.email.trim();
-    const replyAddress = `lead-${lead.id}@reply.thebodylab.co.za`;
+    const replyAddress =
+      `lead-${lead.id}@reply.thebodylab.co.za`;
 
     const { data: emailData, error: emailError } =
       await resend.emails.send({
@@ -112,7 +118,9 @@ export async function POST(req: NextRequest) {
 
       return NextResponse.json(
         {
-          error: emailError.message || "Email could not be sent.",
+          error:
+            emailError.message ||
+            "Email could not be sent.",
         },
         { status: 500 }
       );
@@ -144,35 +152,24 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (lead.status === "New Lead") {
-      const { error: leadUpdateError } = await supabase
-        .from("leads")
-        .update({
-          status: "Contacted",
-          updated_at: sentAt,
-        })
-        .eq("id", lead.id);
+    const nextStatus =
+      lead.status === "New Lead"
+        ? "Contacted"
+        : lead.status;
 
-      if (leadUpdateError) {
-        console.error(
-          "Failed to update lead status:",
-          leadUpdateError
-        );
-      }
-    } else {
-      const { error: timestampUpdateError } = await supabase
-        .from("leads")
-        .update({
-          updated_at: sentAt,
-        })
-        .eq("id", lead.id);
+    const { error: leadUpdateError } = await supabase
+      .from("leads")
+      .update({
+        status: nextStatus,
+        updated_at: sentAt,
+      })
+      .eq("id", lead.id);
 
-      if (timestampUpdateError) {
-        console.error(
-          "Failed to update lead timestamp:",
-          timestampUpdateError
-        );
-      }
+    if (leadUpdateError) {
+      console.error(
+        "Failed to update lead:",
+        leadUpdateError
+      );
     }
 
     const { error: activityError } = await supabase
