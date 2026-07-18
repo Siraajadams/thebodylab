@@ -274,13 +274,25 @@ async function getSession(phone: string) {
     .from("whatsapp_lead_sessions")
     .select("*")
     .eq("phone", cleanedPhone)
-    .maybeSingle();
+    .order("updated_at", { ascending: false })
+    .limit(1);
 
   if (error) {
-    console.error("GET SESSION ERROR:", error);
+    console.error("GET SESSION ERROR:", { phone: cleanedPhone, error });
+    return null;
   }
 
-  return data;
+  const session = data?.[0] || null;
+
+  console.log("CURRENT WHATSAPP SESSION:", {
+    phone: cleanedPhone,
+    sessionId: session?.id || null,
+    leadId: session?.lead_id || null,
+    step: session?.step || null,
+    completed: session?.completed ?? null,
+  });
+
+  return session;
 }
 
 async function upsertSession(phone: string, updates: Record<string, unknown>) {
@@ -294,11 +306,11 @@ async function upsertSession(phone: string, updates: Record<string, unknown>) {
     updated_at: new Date().toISOString(),
   };
 
-  const result = existing
+  const result = existing?.id
     ? await supabase
         .from("whatsapp_lead_sessions")
         .update(payload)
-        .eq("phone", cleanedPhone)
+        .eq("id", existing.id)
         .select()
         .single()
     : await supabase
@@ -311,8 +323,22 @@ async function upsertSession(phone: string, updates: Record<string, unknown>) {
         .single();
 
   if (result.error) {
-    console.error("UPSERT SESSION ERROR:", result.error);
+    console.error("UPSERT SESSION ERROR:", {
+      phone: cleanedPhone,
+      existingSessionId: existing?.id || null,
+      updates,
+      error: result.error,
+    });
+    return null;
   }
+
+  console.log("SESSION SAVED:", {
+    phone: cleanedPhone,
+    sessionId: result.data?.id || null,
+    leadId: result.data?.lead_id || null,
+    step: result.data?.step || null,
+    completed: result.data?.completed ?? null,
+  });
 
   return result.data;
 }
@@ -556,6 +582,17 @@ export async function POST(req: NextRequest) {
     const wantsStart = isStartCommand(incomingText);
     const wantsReset = isResetCommand(incomingText);
 
+    console.log("PROCESSING INBOUND WHATSAPP MESSAGE:", {
+      phone,
+      incomingText,
+      messageType: messageObj.type,
+      wantsStart,
+      wantsReset,
+      currentStep: session?.step || null,
+      sessionId: session?.id || null,
+      leadId: session?.lead_id || null,
+    });
+
     // RESET always starts a new lead and a fresh questionnaire.
     if (wantsReset) {
       await beginNewSession(phone, incomingText, body);
@@ -603,12 +640,21 @@ Type RESET to start again.`,
     const step = session.step as LeadStep;
 
     if (step === "first_name") {
-      await upsertSession(phone, {
+      const savedSession = await upsertSession(phone, {
         lead_id: leadId,
         step: "surname",
         first_name: incomingText,
         completed: false,
       });
+
+      if (!savedSession) {
+        await reply(
+          phone,
+          "We could not save your first name. Please type RESET and try again.",
+          leadId
+        );
+        return NextResponse.json({ success: true });
+      }
 
       await updateLeadById(leadId, {
         first_name: incomingText,
@@ -620,7 +666,22 @@ Type RESET to start again.`,
         last_message: incomingText,
       });
 
-      await reply(phone, surnameMessage(), leadId);
+      console.log("QUESTIONNAIRE ADVANCED:", {
+        phone,
+        fromStep: "first_name",
+        toStep: savedSession.step,
+        firstName: incomingText,
+      });
+
+      const sendResult = await reply(phone, surnameMessage(), leadId);
+
+      console.log("QUESTION 2 SEND RESULT:", {
+        phone,
+        ok: sendResult.ok,
+        status: sendResult.status,
+        metaResponse: sendResult.data,
+      });
+
       return NextResponse.json({ success: true });
     }
 
