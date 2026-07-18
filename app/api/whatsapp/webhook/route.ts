@@ -1,4 +1,4 @@
-  // app/api/whatsapp/webhook/route.ts
+ // app/api/whatsapp/webhook/route.ts
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -953,4 +953,4 @@ name@gmail.com`,
       { status: 500 }
     );
   }
-} 
+}
