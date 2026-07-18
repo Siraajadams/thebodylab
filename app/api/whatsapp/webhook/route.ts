@@ -1,4 +1,4 @@
-// app/api/whatsapp/webhook/route.ts
+  // app/api/whatsapp/webhook/route.ts
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -343,6 +343,56 @@ async function upsertSession(phone: string, updates: Record<string, unknown>) {
   return result.data;
 }
 
+
+async function updateExistingSession(
+  sessionId: string,
+  phone: string,
+  updates: Record<string, unknown>
+) {
+  const supabase = getSupabase();
+  const cleanedPhone = normalisePhone(phone);
+
+  const { data, error } = await supabase
+    .from("whatsapp_lead_sessions")
+    .update({
+      ...updates,
+      phone: cleanedPhone,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", sessionId)
+    .select("*")
+    .maybeSingle();
+
+  if (error) {
+    console.error("DIRECT SESSION UPDATE ERROR:", {
+      sessionId,
+      phone: cleanedPhone,
+      updates,
+      error,
+    });
+    return null;
+  }
+
+  if (!data) {
+    console.error("DIRECT SESSION UPDATE RETURNED NO ROW:", {
+      sessionId,
+      phone: cleanedPhone,
+      updates,
+    });
+    return null;
+  }
+
+  console.log("DIRECT SESSION UPDATE SUCCESS:", {
+    sessionId: data.id,
+    phone: data.phone,
+    leadId: data.lead_id || null,
+    step: data.step,
+    completed: data.completed,
+  });
+
+  return data;
+}
+
 async function createNewLead(phone: string, incomingText: string) {
   const supabase = getSupabase();
   const cleanedPhone = normalisePhone(phone);
@@ -484,7 +534,7 @@ async function beginNewSession(phone: string, incomingText: string, rawPayload: 
 
   await saveMessage(phone, incomingText, "inbound", leadId, rawPayload);
 
-  await upsertSession(phone, {
+  const savedSession = await upsertSession(phone, {
     lead_id: leadId,
     step: "first_name",
     first_name: null,
@@ -494,6 +544,19 @@ async function beginNewSession(phone: string, incomingText: string, rawPayload: 
     notes: null,
     completed: false,
   });
+
+  if (!savedSession) {
+    console.error("FAILED TO CREATE OR RESET WHATSAPP SESSION:", {
+      phone: normalisePhone(phone),
+      leadId,
+    });
+
+    return reply(
+      phone,
+      "We could not start your BodyLab form. Please try again in a moment.",
+      leadId
+    );
+  }
 
   return reply(phone, startMessage(), leadId);
 }
@@ -637,40 +700,87 @@ Type RESET to start again.`,
 
     await saveMessage(phone, incomingText, "inbound", leadId, body);
 
-    const step = session.step as LeadStep;
+    const step = cleanText(session.step).toLowerCase() as LeadStep;
+
+    console.log("NORMALISED QUESTIONNAIRE STEP:", {
+      phone,
+      rawStep: session.step,
+      normalisedStep: step,
+      sessionId: session.id || null,
+    });
 
     if (step === "first_name") {
-      const savedSession = await upsertSession(phone, {
+      const firstName = cleanText(incomingText);
+
+      if (!firstName) {
+        await reply(phone, startMessage(), leadId);
+        return NextResponse.json({ success: true });
+      }
+
+      if (!session?.id) {
+        console.error("FIRST NAME STEP HAS NO SESSION ID:", {
+          phone,
+          leadId,
+          session,
+        });
+
+        await beginNewSession(phone, incomingText, body);
+        return NextResponse.json({ success: true });
+      }
+
+      // Update the exact session row loaded for this inbound message.
+      // This avoids ambiguity if historical duplicate phone rows exist.
+      const savedSession = await updateExistingSession(session.id, phone, {
         lead_id: leadId,
         step: "surname",
-        first_name: incomingText,
+        first_name: firstName,
         completed: false,
       });
 
-      if (!savedSession) {
+      if (!savedSession || savedSession.step !== "surname") {
+        console.error("FIRST NAME WAS NOT PERSISTED:", {
+          phone,
+          sessionId: session.id,
+          leadId,
+          attemptedFirstName: firstName,
+          savedSession,
+        });
+
         await reply(
           phone,
           "We could not save your first name. Please type RESET and try again.",
           leadId
         );
+
         return NextResponse.json({ success: true });
       }
 
-      await updateLeadById(leadId, {
-        first_name: incomingText,
-        full_name: incomingText,
-        status: "In Progress",
-        source: "WhatsApp",
-        phone,
-        whatsapp_id: phone,
-        last_message: incomingText,
-      });
+      // A CRM lead-table update must not block the questionnaire reply.
+      try {
+        await updateLeadById(leadId, {
+          first_name: firstName,
+          full_name: firstName,
+          status: "In Progress",
+          source: "WhatsApp",
+          phone,
+          whatsapp_id: phone,
+          last_message: firstName,
+        });
+      } catch (leadUpdateError) {
+        console.error("NON-BLOCKING FIRST NAME LEAD UPDATE ERROR:", {
+          phone,
+          leadId,
+          error: leadUpdateError,
+        });
+      }
 
       console.log("QUESTIONNAIRE ADVANCED:", {
         phone,
+        sessionId: savedSession.id,
+        leadId,
         fromStep: "first_name",
         toStep: savedSession.step,
-        firstName: incomingText,
+        firstName,
       });
 
       const sendResult = await reply(phone, surnameMessage(), leadId);
@@ -682,7 +792,11 @@ Type RESET to start again.`,
         metaResponse: sendResult.data,
       });
 
-      return NextResponse.json({ success: true });
+      return NextResponse.json({
+        success: true,
+        step: "surname",
+        messageSent: sendResult.ok,
+      });
     }
 
     if (step === "surname") {
@@ -839,4 +953,4 @@ name@gmail.com`,
       { status: 500 }
     );
   }
-}
+} 
