@@ -52,7 +52,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const supabase = getSupabaseAdmin();
+    const supabase = getSupabaseAdmin() as any;
     const resend = new Resend(resendApiKey);
 
     const { data: rawLead, error: leadError } = await supabase
