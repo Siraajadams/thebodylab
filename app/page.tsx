@@ -162,11 +162,16 @@ export default function BodyLabLandingPage() {
               consultation bookings, follow-ups and patient conversions.
             </p>
 
-            <div className="heroButtons">
-              <Link href="/crm/login">Staff login</Link>
-                Access BodyLab CRM
-                <span aria-hidden="true">→</span>
-              </Link>
+            <div className="heroActions">
+  <Link href="/login" className="primaryButton">
+    Access BodyLab CRM
+    <span aria-hidden="true">→</span>
+  </Link>
+
+  <a href="#features" className="secondaryButton">
+    Explore features
+  </a>
+</div>
 
               <a href="#features" className="secondaryButton">
                 Explore features
