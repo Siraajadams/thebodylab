@@ -163,7 +163,7 @@ export default function BodyLabLandingPage() {
             </p>
 
             <div className="heroButtons">
-              <Link href="/login" className="primaryButton">
+              <Link href="/crm/login">Staff login</Link>
                 Access BodyLab CRM
                 <span aria-hidden="true">→</span>
               </Link>
