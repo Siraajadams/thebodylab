@@ -14,13 +14,44 @@ type SendEmailRequest = {
 
 type LeadRecord = {
   id: string;
-  first_name: string | null;
-  surname: string | null;
-  full_name: string | null;
-  email: string | null;
-  status: string | null;
-  service_interest: string | null;
+  first_name?: string | null;
+  surname?: string | null;
+  full_name?: string | null;
+  email?: string | null;
+  status?: string | null;
+  service_interest?: string | null;
+  [key: string]: unknown;
 };
+
+type ResendErrorLike = {
+  message?: string;
+  name?: string;
+  statusCode?: number;
+};
+
+export async function GET() {
+  return NextResponse.json({
+    success: true,
+    route: "/api/crm/send-email",
+    message: "The email route is available. Use POST to send an email.",
+    environment: {
+      resendApiKeyConfigured: Boolean(process.env.RESEND_API_KEY),
+      resendFromEmailConfigured: Boolean(
+        process.env.RESEND_FROM_EMAIL
+      ),
+      resendReplyToConfigured: Boolean(
+        process.env.RESEND_REPLY_TO_EMAIL
+      ),
+      supabaseUrlConfigured: Boolean(
+        process.env.NEXT_PUBLIC_SUPABASE_URL ||
+          process.env.SUPABASE_URL
+      ),
+      supabaseServiceRoleConfigured: Boolean(
+        process.env.SUPABASE_SERVICE_ROLE_KEY
+      ),
+    },
+  });
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -32,10 +63,10 @@ export async function POST(req: NextRequest) {
     const templateKey =
       String(body.templateKey || "").trim() || null;
 
-    console.log("Send email request received:", {
+    console.log("Send email request:", {
       leadId,
-      hasSubject: Boolean(subject),
-      hasMessage: Boolean(message),
+      subjectProvided: Boolean(subject),
+      messageProvided: Boolean(message),
       templateKey,
     });
 
@@ -77,8 +108,14 @@ export async function POST(req: NextRequest) {
       process.env.RESEND_FROM_EMAIL || ""
     ).trim();
 
+    const replyToEmail = String(
+      process.env.RESEND_REPLY_TO_EMAIL ||
+        process.env.RESEND_FROM_EMAIL ||
+        ""
+    ).trim();
+
     if (!resendApiKey || !fromEmail) {
-      console.error("Missing email environment variables:", {
+      console.error("Email environment variables missing:", {
         hasResendApiKey: Boolean(resendApiKey),
         hasFromEmail: Boolean(fromEmail),
       });
@@ -93,37 +130,21 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    /*
-      `as any` is used because generated Supabase types may
-      not yet include every CRM table and column.
-    */
     const supabase = getSupabaseAdmin() as any;
     const resend = new Resend(resendApiKey);
 
     /*
-      IMPORTANT:
-      The leads table uses:
-      - surname, not last_name
-      - service_interest, not service
+      select("*") avoids PostgreSQL error 42703 when the
+      deployed database column names differ from older code.
     */
     const { data: rawLead, error: leadError } = await supabase
       .from("leads")
-      .select(
-        `
-          id,
-          first_name,
-          surname,
-          full_name,
-          email,
-          status,
-          service_interest
-        `
-      )
+      .select("*")
       .eq("id", leadId)
       .maybeSingle();
 
     if (leadError) {
-      console.error("Lead lookup error:", {
+      console.error("Email lead lookup error:", {
         leadId,
         code: leadError.code,
         message: leadError.message,
@@ -137,6 +158,7 @@ export async function POST(req: NextRequest) {
           error: "Unable to retrieve the lead.",
           details: leadError.message,
           code: leadError.code,
+          hint: leadError.hint,
           leadId,
         },
         { status: 500 }
@@ -146,7 +168,7 @@ export async function POST(req: NextRequest) {
     const lead = rawLead as LeadRecord | null;
 
     if (!lead) {
-      console.error("Lead not found:", {
+      console.error("Email lead not found:", {
         leadId,
       });
 
@@ -181,19 +203,7 @@ export async function POST(req: NextRequest) {
         .trim() ||
       "Lead";
 
-    /*
-      Do not use reply.thebodylab.co.za until that domain and
-      inbound email handling are configured.
-
-      Replies will instead go to the address configured below.
-    */
-    const replyToEmail = String(
-      process.env.RESEND_REPLY_TO_EMAIL ||
-        process.env.RESEND_FROM_EMAIL ||
-        ""
-    ).trim();
-
-    console.log("Sending email through Resend:", {
+    console.log("Sending BodyLab email:", {
       leadId: lead.id,
       leadName,
       recipient: leadEmail,
@@ -217,7 +227,7 @@ export async function POST(req: NextRequest) {
         tags: [
           {
             name: "lead_id",
-            value: lead.id,
+            value: sanitizeTagValue(lead.id),
           },
           ...(templateKey
             ? [
@@ -231,20 +241,23 @@ export async function POST(req: NextRequest) {
       });
 
     if (emailError) {
-      console.error("Resend send error:", {
+      const resendError = emailError as ResendErrorLike;
+
+      console.error("Resend email error:", {
         leadId: lead.id,
         recipient: leadEmail,
-        error: emailError,
+        error: resendError,
       });
 
       return NextResponse.json(
         {
           success: false,
           error:
-            emailError.message || "Email could not be sent.",
-          details: emailError,
+            resendError.message ||
+            "Email could not be sent through Resend.",
+          details: resendError,
         },
-        { status: 500 }
+        { status: resendError.statusCode || 500 }
       );
     }
 
@@ -252,9 +265,8 @@ export async function POST(req: NextRequest) {
     const sentAt = new Date().toISOString();
 
     /*
-      Save the outbound email in the lead conversation history.
-      A local database error should not falsely indicate that
-      Resend failed to send the email.
+      Save to lead_messages, but do not treat a local
+      database logging failure as an email delivery failure.
     */
     const messagePayload = {
       lead_id: lead.id,
@@ -302,7 +314,7 @@ export async function POST(req: NextRequest) {
       .eq("id", lead.id);
 
     if (leadUpdateError) {
-      console.error("Failed to update lead:", {
+      console.error("Failed to update lead after email:", {
         code: leadUpdateError.code,
         message: leadUpdateError.message,
         details: leadUpdateError.details,
@@ -366,8 +378,7 @@ function normalizeEmail(value: unknown): string {
     return "";
   }
 
-  const emailPattern =
-    /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
   return emailPattern.test(email) ? email : "";
 }
