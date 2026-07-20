@@ -25,7 +25,7 @@ export default function LoginPage() {
     }
 
     localStorage.setItem("bodylab_authenticated", "true");
-    router.push("/crm");
+    router.push("/dashboard");
   }
 
   return (
