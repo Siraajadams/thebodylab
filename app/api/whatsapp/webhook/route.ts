@@ -6,7 +6,10 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const META_API_VERSION = process.env.WHATSAPP_API_VERSION || "v25.0";
+const META_API_VERSION =
+  process.env.META_GRAPH_API_VERSION ||
+  process.env.WHATSAPP_API_VERSION ||
+  "v25.0";
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "";
 const WHATSAPP_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN || "";
 const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || "";
@@ -27,6 +30,17 @@ type SendResult = {
   ok: boolean;
   status: number;
   data: any;
+  messageId: string | null;
+};
+
+type WhatsAppStatus = {
+  id?: string;
+  status?: string;
+  timestamp?: string;
+  recipient_id?: string;
+  conversation?: Record<string, unknown>;
+  pricing?: Record<string, unknown>;
+  errors?: Array<Record<string, unknown>>;
 };
 
 let supabaseClient: SupabaseClient | null = null;
@@ -144,6 +158,7 @@ async function callWhatsAppApi(payload: Record<string, unknown>): Promise<SendRe
       ok: false,
       status: 500,
       data: { error: "WHATSAPP_ACCESS_TOKEN is missing." },
+      messageId: null,
     };
   }
 
@@ -153,6 +168,7 @@ async function callWhatsAppApi(payload: Record<string, unknown>): Promise<SendRe
       ok: false,
       status: 500,
       data: { error: "WHATSAPP_PHONE_NUMBER_ID is missing." },
+      messageId: null,
     };
   }
 
@@ -200,6 +216,7 @@ async function callWhatsAppApi(payload: Record<string, unknown>): Promise<SendRe
     ok: response.ok,
     status: response.status,
     data,
+    messageId: cleanText(data?.messages?.[0]?.id) || null,
   };
 }
 
@@ -231,31 +248,119 @@ async function saveMessage(
   messageText: string,
   direction: "inbound" | "outbound",
   leadId?: string | null,
-  rawPayload?: any
+  rawPayload?: any,
+  tracking?: {
+    externalMessageId?: string | null;
+    eventTime?: string | null;
+    deliveryStatus?: string | null;
+    messageType?: string | null;
+  }
 ) {
   const supabase = getSupabase();
+  const cleanPhone = normalisePhone(phone);
+  const eventTime = tracking?.eventTime || new Date().toISOString();
 
-  const { error } = await supabase.from("whatsapp_messages").insert({
-    phone: normalisePhone(phone),
+  const payload = {
+    phone: cleanPhone,
     lead_id: leadId || null,
     message_text: messageText,
     direction,
-    raw_payload: rawPayload || null,
-    created_at: new Date().toISOString(),
+    raw_payload: {
+      ...(rawPayload && typeof rawPayload === "object" ? rawPayload : {}),
+      message_tracking: {
+        external_message_id: tracking?.externalMessageId || null,
+        event_time: eventTime,
+        delivery_status:
+          tracking?.deliveryStatus ||
+          (direction === "inbound" ? "received" : "accepted"),
+        message_type: tracking?.messageType || "text",
+        sender: direction === "inbound" ? cleanPhone : PHONE_NUMBER_ID,
+        recipient: direction === "inbound" ? PHONE_NUMBER_ID : cleanPhone,
+      },
+    },
+    created_at: eventTime,
+  };
+
+  const { data, error } = await supabase
+    .from("whatsapp_messages")
+    .insert(payload)
+    .select("id")
+    .maybeSingle();
+
+  if (!error) {
+    console.log("WHATSAPP MESSAGE SAVED:", {
+      id: data?.id || null,
+      phone: cleanPhone,
+      leadId: leadId || null,
+      direction,
+      eventTime,
+      externalMessageId: tracking?.externalMessageId || null,
+    });
+    return true;
+  }
+
+  console.error("WHATSAPP MESSAGE SAVE ERROR:", {
+    code: error.code,
+    message: error.message,
+    details: error.details,
+    hint: error.hint,
+    payload,
   });
 
-  if (error) {
-    console.error("WHATSAPP MESSAGE SAVE ERROR:", error);
+  if (leadId) {
+    const fallbackPayload = {
+      ...payload,
+      lead_id: null,
+      raw_payload: {
+        ...payload.raw_payload,
+        message_tracking: {
+          ...payload.raw_payload.message_tracking,
+          original_lead_id: leadId,
+          save_fallback: "lead_id_removed",
+        },
+      },
+    };
+
+    const { data: fallbackData, error: fallbackError } = await supabase
+      .from("whatsapp_messages")
+      .insert(fallbackPayload)
+      .select("id")
+      .maybeSingle();
+
+    if (!fallbackError) {
+      console.warn("WHATSAPP MESSAGE SAVED WITHOUT LEAD ID:", {
+        id: fallbackData?.id || null,
+        originalLeadId: leadId,
+        phone: cleanPhone,
+        direction,
+      });
+      return true;
+    }
+
+    console.error("WHATSAPP MESSAGE FALLBACK SAVE ERROR:", {
+      code: fallbackError.code,
+      message: fallbackError.message,
+      details: fallbackError.details,
+      hint: fallbackError.hint,
+    });
   }
+
+  return false;
 }
 
 async function reply(phone: string, message: string, leadId?: string | null) {
+  const sentAt = new Date().toISOString();
   const result = await sendWhatsAppText(phone, message);
 
-  if (result.ok) {
-    await saveMessage(phone, message, "outbound", leadId);
-  } else {
-    console.error("OUTBOUND MESSAGE WAS NOT SAVED AS SENT:", {
+  await saveMessage(phone, message, "outbound", leadId, result.data, {
+    externalMessageId: result.messageId,
+    eventTime: sentAt,
+    deliveryStatus: result.ok ? "accepted" : "failed",
+    messageType: "text",
+  });
+
+  if (!result.ok) {
+    console.error("OUTBOUND WHATSAPP SEND FAILED:", {
       phone,
       leadId,
       metaStatus: result.status,
@@ -461,7 +566,16 @@ async function beginNewSession(phone: string, incomingText: string, rawPayload: 
   const newLead = await createNewLead(phone, incomingText);
   const leadId = newLead?.id || null;
 
-  await saveMessage(phone, incomingText, "inbound", leadId, rawPayload);
+  const incomingMessage = rawPayload?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+
+  await saveMessage(phone, incomingText, "inbound", leadId, rawPayload, {
+    externalMessageId: cleanText(incomingMessage?.id),
+    eventTime: incomingMessage?.timestamp
+      ? new Date(Number(incomingMessage.timestamp) * 1000).toISOString()
+      : new Date().toISOString(),
+    deliveryStatus: "received",
+    messageType: cleanText(incomingMessage?.type) || "text",
+  });
 
   await upsertSession(phone, {
     lead_id: leadId,
@@ -514,24 +628,34 @@ export async function POST(req: NextRequest) {
 
     const change = body?.entry?.[0]?.changes?.[0];
     const value = change?.value;
-    const messageObj = value?.messages?.[0];
+    const statuses = (value?.statuses || []) as WhatsAppStatus[];
 
-    // Delivery/read/status events do not contain an inbound message.
-    if (!messageObj) {
-      console.log("WHATSAPP STATUS OR NON-MESSAGE EVENT:", {
-        statuses: value?.statuses || null,
-        field: change?.field || null,
-      });
+    if (statuses.length > 0) {
+      console.log("WHATSAPP STATUS EVENT:", statuses);
 
       return NextResponse.json({
         success: true,
-        message: "Status or non-message event received.",
+        message: "WhatsApp status event received.",
+        statusesProcessed: statuses.length,
+      });
+    }
+
+    const messageObj = value?.messages?.[0];
+
+    if (!messageObj) {
+      return NextResponse.json({
+        success: true,
+        message: "Non-message event received.",
       });
     }
 
     const phone = normalisePhone(messageObj.from);
     const incomingText = extractIncomingText(messageObj);
     const incomingMessageId = cleanText(messageObj.id);
+    const incomingTime = messageObj.timestamp
+      ? new Date(Number(messageObj.timestamp) * 1000).toISOString()
+      : new Date().toISOString();
+    const incomingMessageType = cleanText(messageObj.type) || "unknown";
 
     if (incomingMessageId) {
       await markMessageAsRead(incomingMessageId);
@@ -579,7 +703,12 @@ export async function POST(req: NextRequest) {
     // If an active questionnaire exists, repeat the current prompt instead of
     // creating duplicate leads.
     if (wantsStart) {
-      await saveMessage(phone, incomingText, "inbound", leadId, body);
+      await saveMessage(phone, incomingText, "inbound", leadId, body, {
+        externalMessageId: incomingMessageId,
+        eventTime: incomingTime,
+        deliveryStatus: "received",
+        messageType: incomingMessageType,
+      });
 
       const promptByStep: Record<LeadStep, string> = {
         first_name: startMessage(),
@@ -603,7 +732,12 @@ Type RESET to start again.`,
       return NextResponse.json({ success: true });
     }
 
-    await saveMessage(phone, incomingText, "inbound", leadId, body);
+    await saveMessage(phone, incomingText, "inbound", leadId, body, {
+      externalMessageId: incomingMessageId,
+      eventTime: incomingTime,
+      deliveryStatus: "received",
+      messageType: incomingMessageType,
+    });
 
     const step = session.step as LeadStep;
 
