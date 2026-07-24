@@ -170,7 +170,7 @@ export async function POST(req: NextRequest) {
     ).trim();
 
     const graphApiVersion = String(
-      process.env.META_GRAPH_API_VERSION || "v23.0"
+      process.env.META_GRAPH_API_VERSION || process.env.WHATSAPP_API_VERSION || "v25.0"
     ).trim();
 
     if (!accessToken || !phoneNumberId) {
@@ -306,9 +306,47 @@ export async function POST(req: NextRequest) {
       : message;
 
     /*
-      Save the message in the CRM conversation history.
-      Failure to save locally must not falsely report that Meta
-      failed to send the WhatsApp message.
+      Save the outbound message first in whatsapp_messages.
+
+      This uses only the core columns already used by the working webhook,
+      making it compatible with the existing table structure.
+    */
+    const whatsappMessagePayload = {
+      lead_id: lead.id,
+      phone,
+      direction: "outbound",
+      message_text: storedMessage,
+      raw_payload: {
+        ...whatsappResult,
+        message_tracking: {
+          external_message_id: externalMessageId,
+          message_type: useTemplate ? "template" : "text",
+          template_name: useTemplate ? templateName : null,
+          sender_phone_number_id: phoneNumberId,
+          recipient: phone,
+          sent_at: sentAt,
+          delivery_status: "sent",
+        },
+      },
+      created_at: sentAt,
+    };
+
+    const { error: whatsappMessageInsertError } = await supabase
+      .from("whatsapp_messages")
+      .insert(whatsappMessagePayload);
+
+    if (whatsappMessageInsertError) {
+      console.error("Failed to save whatsapp_messages record:", {
+        code: whatsappMessageInsertError.code,
+        message: whatsappMessageInsertError.message,
+        details: whatsappMessageInsertError.details,
+        hint: whatsappMessageInsertError.hint,
+      });
+    }
+
+    /*
+      Save to lead_messages as a secondary log.
+      A failure here does not stop WhatsApp sending or the primary save.
     */
     const leadMessagePayload = {
       lead_id: lead.id,
@@ -330,40 +368,11 @@ export async function POST(req: NextRequest) {
       .insert(leadMessagePayload);
 
     if (messageInsertError) {
-      console.error("Failed to save lead_messages record:", {
+      console.warn("lead_messages save skipped or failed:", {
         code: messageInsertError.code,
         message: messageInsertError.message,
         details: messageInsertError.details,
         hint: messageInsertError.hint,
-      });
-    }
-
-    /*
-      Also save the outbound message in whatsapp_messages,
-      which is the table already receiving your WhatsApp webhook data.
-    */
-    const whatsappMessagePayload = {
-      lead_id: lead.id,
-      phone,
-      direction: "outbound",
-      message_text: storedMessage,
-      message_type: useTemplate ? "template" : "text",
-      external_message_id: externalMessageId,
-      delivery_status: "sent",
-      raw_payload: whatsappResult,
-      created_at: sentAt,
-    };
-
-    const { error: whatsappMessageInsertError } = await supabase
-      .from("whatsapp_messages")
-      .insert(whatsappMessagePayload);
-
-    if (whatsappMessageInsertError) {
-      console.error("Failed to save whatsapp_messages record:", {
-        code: whatsappMessageInsertError.code,
-        message: whatsappMessageInsertError.message,
-        details: whatsappMessageInsertError.details,
-        hint: whatsappMessageInsertError.hint,
       });
     }
 
@@ -394,7 +403,7 @@ export async function POST(req: NextRequest) {
     const activityPayload = {
       lead_id: lead.id,
       activity_type: "whatsapp_sent",
-      description: `WhatsApp message sent to ${leadDisplayName}.`,
+      description: `WhatsApp message sent to ${leadDisplayName} (${phone}) at ${sentAt}.`,
       created_at: sentAt,
     };
 
@@ -419,6 +428,7 @@ export async function POST(req: NextRequest) {
       leadId: lead.id,
       leadName: leadDisplayName,
       messageType: useTemplate ? "template" : "text",
+      sentAt,
       localStorage: {
         leadMessagesSaved: !messageInsertError,
         whatsappMessagesSaved: !whatsappMessageInsertError,
