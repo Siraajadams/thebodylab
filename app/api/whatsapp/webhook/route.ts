@@ -258,7 +258,12 @@ async function messageExists(externalMessageId: string) {
     .maybeSingle();
 
   if (error) {
-    console.error("WHATSAPP MESSAGE DUPLICATE CHECK ERROR:", error);
+    console.error("WHATSAPP MESSAGE DUPLICATE CHECK ERROR:", {
+      code: error.code,
+      message: error.message,
+      details: error.details,
+      hint: error.hint,
+    });
     return false;
   }
 
@@ -379,7 +384,12 @@ async function saveMessage(
       return true;
     }
 
-    console.error("WHATSAPP MESSAGE FALLBACK SAVE ERROR:", fallbackError);
+    console.error("WHATSAPP MESSAGE FALLBACK SAVE ERROR:", {
+      code: fallbackError.code,
+      message: fallbackError.message,
+      details: fallbackError.details,
+      hint: fallbackError.hint,
+    });
   }
 
   return false;
@@ -447,7 +457,10 @@ async function updateMessageStatuses(statuses: WhatsAppStatus[]) {
       console.error("WHATSAPP STATUS UPDATE ERROR:", {
         externalMessageId,
         deliveryStatus,
-        error,
+        code: error.code,
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
       });
     } else {
       console.log("WHATSAPP STATUS UPDATED:", {
@@ -1006,4 +1019,3 @@ name@gmail.com`,
       { status: 500 }
     );
   }
-}
