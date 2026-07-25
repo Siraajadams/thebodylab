@@ -440,34 +440,103 @@ async function updateMessageStatuses(statuses: WhatsAppStatus[]) {
       updated_at: new Date().toISOString(),
     };
 
-    if (deliveryStatus === "sent") updatePayload.sent_at = eventTime;
-    if (deliveryStatus === "delivered") updatePayload.delivered_at = eventTime;
-    if (deliveryStatus === "read") updatePayload.read_at = eventTime;
-    if (deliveryStatus === "failed") updatePayload.failed_at = eventTime;
+    if (deliveryStatus === "sent") {
+      updatePayload.sent_at = eventTime;
+    }
 
-    const { data, error } = await supabase
+    if (deliveryStatus === "delivered") {
+      updatePayload.delivered_at = eventTime;
+    }
+
+    if (deliveryStatus === "read") {
+      updatePayload.read_at = eventTime;
+    }
+
+    if (deliveryStatus === "failed") {
+      updatePayload.failed_at = eventTime;
+    }
+
+    /*
+      First match the canonical external_message_id.
+      If no record is matched, fall back to whatsapp_message_id.
+      This avoids PostgREST OR-filter parsing problems with wamid values.
+    */
+    let { data: updatedRows, error: updateError } = await supabase
       .from("whatsapp_messages")
       .update(updatePayload)
-      .or(
-        `external_message_id.eq.${externalMessageId},whatsapp_message_id.eq.${externalMessageId}`
-      )
-      .select("id");
+      .eq("external_message_id", externalMessageId)
+      .select("id, lead_id");
 
-    if (error) {
+    if (!updateError && (!updatedRows || updatedRows.length === 0)) {
+      const fallbackResult = await supabase
+        .from("whatsapp_messages")
+        .update(updatePayload)
+        .eq("whatsapp_message_id", externalMessageId)
+        .select("id, lead_id");
+
+      updatedRows = fallbackResult.data;
+      updateError = fallbackResult.error;
+    }
+
+    if (updateError) {
       console.error("WHATSAPP STATUS UPDATE ERROR:", {
         externalMessageId,
         deliveryStatus,
-        code: error.code,
-        message: error.message,
-        details: error.details,
-        hint: error.hint,
+        eventTime,
+        code: updateError.code,
+        message: updateError.message,
+        details: updateError.details,
+        hint: updateError.hint,
+        statusEvent,
       });
-    } else {
-      console.log("WHATSAPP STATUS UPDATED:", {
+      continue;
+    }
+
+    console.log("WHATSAPP STATUS UPDATED:", {
+      externalMessageId,
+      deliveryStatus,
+      eventTime,
+      matchedRecords: updatedRows?.length || 0,
+      errors: statusEvent.errors || null,
+    });
+
+    /*
+      Keep the optional lead_messages table in sync.
+      Failure here does not affect the primary WhatsApp record.
+    */
+    const leadMessageUpdate: Record<string, unknown> = {
+      delivery_status: deliveryStatus,
+    };
+
+    if (deliveryStatus === "sent") {
+      leadMessageUpdate.sent_at = eventTime;
+    }
+
+    if (deliveryStatus === "delivered") {
+      leadMessageUpdate.delivered_at = eventTime;
+    }
+
+    if (deliveryStatus === "read") {
+      leadMessageUpdate.read_at = eventTime;
+    }
+
+    if (deliveryStatus === "failed") {
+      leadMessageUpdate.failed_at = eventTime;
+    }
+
+    const { error: leadMessageError } = await supabase
+      .from("lead_messages")
+      .update(leadMessageUpdate)
+      .eq("external_message_id", externalMessageId);
+
+    if (leadMessageError) {
+      console.warn("LEAD MESSAGE STATUS UPDATE FAILED:", {
         externalMessageId,
         deliveryStatus,
-        eventTime,
-        matchedRecords: data?.length || 0,
+        code: leadMessageError.code,
+        message: leadMessageError.message,
+        details: leadMessageError.details,
+        hint: leadMessageError.hint,
       });
     }
   }
