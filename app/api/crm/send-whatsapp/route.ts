@@ -170,7 +170,9 @@ export async function POST(req: NextRequest) {
     ).trim();
 
     const graphApiVersion = String(
-      process.env.META_GRAPH_API_VERSION || process.env.WHATSAPP_API_VERSION || "v25.0"
+      process.env.META_GRAPH_API_VERSION ||
+        process.env.WHATSAPP_API_VERSION ||
+        "v25.0"
     ).trim();
 
     if (!accessToken || !phoneNumberId) {
@@ -529,3 +531,4 @@ function normalizePhoneNumber(value: unknown): string {
   }
 
   return phone;
+}
