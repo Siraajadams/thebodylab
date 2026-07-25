@@ -4,11 +4,20 @@ import { getSupabaseAdmin } from "../../../../lib/supabaseAdmin";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+const DEFAULT_WELCOME_TEMPLATE =
+  process.env.WHATSAPP_WELCOME_TEMPLATE_NAME || "bodylab_welcome";
+
+const DEFAULT_TEMPLATE_LANGUAGE =
+  process.env.WHATSAPP_TEMPLATE_LANGUAGE || "en";
+
+const CUSTOMER_SERVICE_WINDOW_HOURS = 24;
+
 type SendWhatsAppRequest = {
   leadId?: string;
   message?: string;
   templateName?: string;
   templateVariables?: string[];
+  forceTemplate?: boolean;
 };
 
 type LeadRecord = {
@@ -45,17 +54,24 @@ type WhatsAppApiResponse = {
   };
 };
 
+type LatestInboundRecord = {
+  id: string;
+  received_at: string | null;
+  created_at: string | null;
+};
+
 export async function POST(req: NextRequest) {
   try {
     const body = (await req.json()) as SendWhatsAppRequest;
 
-    const leadId = String(body.leadId || "").trim();
-    const message = String(body.message || "").trim();
-    const templateName = String(body.templateName || "").trim();
+    const leadId = cleanText(body.leadId);
+    const requestedMessage = cleanText(body.message);
+    const requestedTemplateName = cleanText(body.templateName);
+    const forceTemplate = body.forceTemplate === true;
 
-    const templateVariables = Array.isArray(body.templateVariables)
+    const suppliedTemplateVariables = Array.isArray(body.templateVariables)
       ? body.templateVariables
-          .map((value) => String(value || "").trim())
+          .map((value) => cleanText(value))
           .filter(Boolean)
       : [];
 
@@ -69,30 +85,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const useTemplate = Boolean(templateName);
-
-    if (!useTemplate && !message) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "A WhatsApp message or approved template is required.",
-        },
-        { status: 400 }
-      );
-    }
-
-    /*
-      `as any` is used because generated Supabase database
-      types may not yet include all CRM columns.
-    */
     const supabase = getSupabaseAdmin() as any;
 
-    /*
-      IMPORTANT:
-      The leads table uses:
-      - surname, not last_name
-      - service_interest, not service
-    */
     const { data: rawLead, error: leadError } = await supabase
       .from("leads")
       .select(
@@ -125,7 +119,6 @@ export async function POST(req: NextRequest) {
           error: "Unable to retrieve the lead.",
           details: leadError.message,
           code: leadError.code,
-          leadId,
         },
         { status: 500 }
       );
@@ -134,10 +127,6 @@ export async function POST(req: NextRequest) {
     const lead = rawLead as LeadRecord | null;
 
     if (!lead) {
-      console.error("Lead not found:", {
-        leadId,
-      });
-
       return NextResponse.json(
         {
           success: false,
@@ -154,24 +143,21 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         {
           success: false,
-          error: "The lead does not have a valid phone number.",
+          error: "The lead does not have a valid South African phone number.",
           leadId: lead.id,
         },
         { status: 400 }
       );
     }
 
-    const accessToken = String(
-      process.env.WHATSAPP_ACCESS_TOKEN || ""
-    ).trim();
-
-    const phoneNumberId = String(
-      process.env.WHATSAPP_PHONE_NUMBER_ID || ""
-    ).trim();
-
-    const graphApiVersion = String(
-      process.env.META_GRAPH_API_VERSION || process.env.WHATSAPP_API_VERSION || "v25.0"
-    ).trim();
+    const accessToken = cleanText(process.env.WHATSAPP_ACCESS_TOKEN);
+    const phoneNumberId = cleanText(
+      process.env.WHATSAPP_PHONE_NUMBER_ID
+    );
+    const graphApiVersion =
+      cleanText(process.env.META_GRAPH_API_VERSION) ||
+      cleanText(process.env.WHATSAPP_API_VERSION) ||
+      "v25.0";
 
     if (!accessToken || !phoneNumberId) {
       console.error("Missing WhatsApp environment variables:", {
@@ -189,6 +175,94 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    /*
+      A free-form WhatsApp text message is allowed only while the
+      24-hour customer-service window is open. The window opens when
+      the customer sends an inbound message.
+    */
+    const windowStart = new Date(
+      Date.now() -
+        CUSTOMER_SERVICE_WINDOW_HOURS * 60 * 60 * 1000
+    ).toISOString();
+
+    const { data: latestInboundRaw, error: inboundLookupError } =
+      await supabase
+        .from("whatsapp_messages")
+        .select("id, received_at, created_at")
+        .eq("direction", "inbound")
+        .or(`lead_id.eq.${lead.id},phone.eq.${phone}`)
+        .gte("created_at", windowStart)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+    if (inboundLookupError) {
+      console.warn(
+        "Unable to determine the WhatsApp customer-service window:",
+        {
+          leadId: lead.id,
+          phone,
+          code: inboundLookupError.code,
+          message: inboundLookupError.message,
+          details: inboundLookupError.details,
+          hint: inboundLookupError.hint,
+        }
+      );
+    }
+
+    const latestInbound =
+      (latestInboundRaw as LatestInboundRecord | null) || null;
+
+    const customerServiceWindowOpen = Boolean(
+      latestInbound &&
+        isWithinLastHours(
+          latestInbound.received_at || latestInbound.created_at,
+          CUSTOMER_SERVICE_WINDOW_HOURS
+        )
+    );
+
+    /*
+      Use an approved template when:
+      - the caller explicitly requests a template;
+      - forceTemplate is true; or
+      - the customer-service window is closed.
+
+      Otherwise send the requested free-form message.
+    */
+    const useTemplate =
+      forceTemplate ||
+      Boolean(requestedTemplateName) ||
+      !customerServiceWindowOpen;
+
+    const effectiveTemplateName =
+      requestedTemplateName || DEFAULT_WELCOME_TEMPLATE;
+
+    if (!useTemplate && !requestedMessage) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "A WhatsApp message is required.",
+        },
+        { status: 400 }
+      );
+    }
+
+    if (useTemplate && !effectiveTemplateName) {
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            "An approved WhatsApp template is required because the 24-hour customer-service window is closed.",
+        },
+        { status: 400 }
+      );
+    }
+
+    /*
+      Template variables are only included when they are explicitly
+      supplied by the CRM. This prevents Meta rejecting a template
+      whose approved body has no placeholders.
+    */
     const whatsappPayload = useTemplate
       ? {
           messaging_product: "whatsapp",
@@ -196,19 +270,21 @@ export async function POST(req: NextRequest) {
           to: phone,
           type: "template",
           template: {
-            name: templateName,
+            name: effectiveTemplateName,
             language: {
-              code: "en",
+              code: DEFAULT_TEMPLATE_LANGUAGE,
             },
-            ...(templateVariables.length > 0
+            ...(suppliedTemplateVariables.length > 0
               ? {
                   components: [
                     {
                       type: "body",
-                      parameters: templateVariables.map((value) => ({
-                        type: "text",
-                        text: value,
-                      })),
+                      parameters: suppliedTemplateVariables.map(
+                        (value) => ({
+                          type: "text",
+                          text: value,
+                        })
+                      ),
                     },
                   ],
                 }
@@ -222,15 +298,20 @@ export async function POST(req: NextRequest) {
           type: "text",
           text: {
             preview_url: true,
-            body: message,
+            body: requestedMessage,
           },
         };
 
     console.log("Sending WhatsApp message:", {
       leadId: lead.id,
       recipient: phone,
+      customerServiceWindowOpen,
       messageType: useTemplate ? "template" : "text",
-      templateName: useTemplate ? templateName : null,
+      templateName: useTemplate ? effectiveTemplateName : null,
+      latestInboundAt:
+        latestInbound?.received_at ||
+        latestInbound?.created_at ||
+        null,
     });
 
     const whatsappResponse = await fetch(
@@ -264,6 +345,7 @@ export async function POST(req: NextRequest) {
         status: whatsappResponse.status,
         statusText: whatsappResponse.statusText,
         response: whatsappResult,
+        payload: whatsappPayload,
       });
 
       return NextResponse.json(
@@ -277,6 +359,11 @@ export async function POST(req: NextRequest) {
             whatsappResult.error,
           metaCode: whatsappResult.error?.code,
           metaSubcode: whatsappResult.error?.error_subcode,
+          messageType: useTemplate ? "template" : "text",
+          templateName: useTemplate
+            ? effectiveTemplateName
+            : null,
+          customerServiceWindowOpen,
         },
         {
           status:
@@ -290,8 +377,8 @@ export async function POST(req: NextRequest) {
 
     const externalMessageId =
       whatsappResult.messages?.[0]?.id || null;
-
     const sentAt = new Date().toISOString();
+    const deliveryStatus = "accepted";
 
     if (!externalMessageId) {
       console.warn(
@@ -305,7 +392,7 @@ export async function POST(req: NextRequest) {
     }
 
     const leadDisplayName =
-      String(lead.full_name || "").trim() ||
+      cleanText(lead.full_name) ||
       [lead.first_name, lead.surname]
         .filter(Boolean)
         .join(" ")
@@ -313,15 +400,10 @@ export async function POST(req: NextRequest) {
       "lead";
 
     const storedMessage = useTemplate
-      ? message || `WhatsApp template sent: ${templateName}`
-      : message;
+      ? requestedMessage ||
+        `WhatsApp template sent: ${effectiveTemplateName}`
+      : requestedMessage;
 
-    const deliveryStatus = "accepted";
-
-    /*
-      Save the outbound message in the same columns used by the webhook.
-      The Meta wamid is the key used later for sent/delivered/read updates.
-    */
     const whatsappMessagePayload = {
       lead_id: lead.id,
       phone,
@@ -336,7 +418,14 @@ export async function POST(req: NextRequest) {
       status: deliveryStatus,
       delivery_status: deliveryStatus,
 
-      template_name: useTemplate ? templateName : null,
+      message_type: useTemplate ? "template" : "text",
+      template_name: useTemplate
+        ? effectiveTemplateName
+        : null,
+
+      profile_name: null,
+      sender: phoneNumberId,
+      recipient: phone,
 
       sent_at: sentAt,
       received_at: null,
@@ -347,17 +436,36 @@ export async function POST(req: NextRequest) {
       status_payload: null,
       status_error: null,
 
-      raw_payload: whatsappResult,
+      raw_payload: {
+        meta_response: whatsappResult,
+        send_context: {
+          customer_service_window_open:
+            customerServiceWindowOpen,
+          latest_inbound_at:
+            latestInbound?.received_at ||
+            latestInbound?.created_at ||
+            null,
+          forced_template: forceTemplate,
+          requested_template_name:
+            requestedTemplateName || null,
+          effective_template_name: useTemplate
+            ? effectiveTemplateName
+            : null,
+        },
+      },
+
       created_at: sentAt,
       updated_at: sentAt,
     };
 
-    const { data: savedWhatsAppMessage, error: whatsappMessageInsertError } =
-      await supabase
-        .from("whatsapp_messages")
-        .insert(whatsappMessagePayload)
-        .select("id")
-        .maybeSingle();
+    const {
+      data: savedWhatsAppMessage,
+      error: whatsappMessageInsertError,
+    } = await supabase
+      .from("whatsapp_messages")
+      .insert(whatsappMessagePayload)
+      .select("id")
+      .maybeSingle();
 
     if (whatsappMessageInsertError) {
       console.error("Failed to save whatsapp_messages record:", {
@@ -374,55 +482,55 @@ export async function POST(req: NextRequest) {
         recipient: phone,
         externalMessageId,
         deliveryStatus,
+        messageType: useTemplate ? "template" : "text",
+        templateName: useTemplate
+          ? effectiveTemplateName
+          : null,
         sentAt,
       });
     }
 
-    /*
-      Save to lead_messages as a secondary log.
-      A failure here does not stop WhatsApp sending or the primary save.
-    */
     const leadMessagePayload = {
       lead_id: lead.id,
       channel: "whatsapp",
       direction: "outbound",
       message_type: useTemplate ? "template" : "text",
-      template_key: useTemplate ? templateName : null,
+      template_key: useTemplate
+        ? effectiveTemplateName
+        : null,
       subject: null,
       message_body: storedMessage,
       external_message_id: externalMessageId,
       sender: phoneNumberId,
       recipient: phone,
-      delivery_status: "sent",
+      delivery_status: deliveryStatus,
       sent_at: sentAt,
     };
 
-    const { error: messageInsertError } = await supabase
+    const { error: leadMessageInsertError } = await supabase
       .from("lead_messages")
       .insert(leadMessagePayload);
 
-    if (messageInsertError) {
+    if (leadMessageInsertError) {
       console.warn("lead_messages save skipped or failed:", {
-        code: messageInsertError.code,
-        message: messageInsertError.message,
-        details: messageInsertError.details,
-        hint: messageInsertError.hint,
+        code: leadMessageInsertError.code,
+        message: leadMessageInsertError.message,
+        details: leadMessageInsertError.details,
+        hint: leadMessageInsertError.hint,
       });
     }
 
-    const currentStatus = String(lead.status || "").trim();
-
-    const leadUpdatePayload = {
-      status:
-        !currentStatus || currentStatus === "New Lead"
-          ? "Contacted"
-          : currentStatus,
-      updated_at: sentAt,
-    };
+    const currentStatus = cleanText(lead.status);
 
     const { error: leadUpdateError } = await supabase
       .from("leads")
-      .update(leadUpdatePayload)
+      .update({
+        status:
+          !currentStatus || currentStatus === "New Lead"
+            ? "Contacted"
+            : currentStatus,
+        updated_at: sentAt,
+      })
       .eq("id", lead.id);
 
     if (leadUpdateError) {
@@ -434,16 +542,18 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const activityPayload = {
-      lead_id: lead.id,
-      activity_type: "whatsapp_sent",
-      description: `WhatsApp message sent to ${leadDisplayName} (${phone}) at ${sentAt}.`,
-      created_at: sentAt,
-    };
-
     const { error: activityError } = await supabase
       .from("activities")
-      .insert(activityPayload);
+      .insert({
+        lead_id: lead.id,
+        activity_type: "whatsapp_sent",
+        description: `WhatsApp ${
+          useTemplate
+            ? `template ${effectiveTemplateName}`
+            : "message"
+        } sent to ${leadDisplayName} (${phone}) at ${sentAt}.`,
+        created_at: sentAt,
+      });
 
     if (activityError) {
       console.warn("WhatsApp activity was not saved:", {
@@ -456,17 +566,28 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      message: "WhatsApp message sent successfully.",
+      message: useTemplate
+        ? "WhatsApp template sent successfully."
+        : "WhatsApp message sent successfully.",
       messageId: externalMessageId,
       recipient: phone,
       leadId: lead.id,
       leadName: leadDisplayName,
       messageType: useTemplate ? "template" : "text",
+      templateName: useTemplate
+        ? effectiveTemplateName
+        : null,
+      customerServiceWindowOpen,
+      latestInboundAt:
+        latestInbound?.received_at ||
+        latestInbound?.created_at ||
+        null,
       deliveryStatus,
       sentAt,
       localStorage: {
-        leadMessagesSaved: !messageInsertError,
-        whatsappMessagesSaved: !whatsappMessageInsertError,
+        leadMessagesSaved: !leadMessageInsertError,
+        whatsappMessagesSaved:
+          !whatsappMessageInsertError,
         leadUpdated: !leadUpdateError,
         activitySaved: !activityError,
       },
@@ -487,56 +608,52 @@ export async function POST(req: NextRequest) {
   }
 }
 
+function cleanText(value: unknown): string {
+  return String(value ?? "").trim();
+}
+
+function isWithinLastHours(
+  timestamp: string | null | undefined,
+  hours: number
+): boolean {
+  if (!timestamp) return false;
+
+  const parsed = new Date(timestamp).getTime();
+
+  if (!Number.isFinite(parsed)) return false;
+
+  const age = Date.now() - parsed;
+
+  return age >= 0 && age <= hours * 60 * 60 * 1000;
+}
+
 function normalizePhoneNumber(value: unknown): string {
-  let phone = String(value || "")
-    .trim()
-    .replace(/[^\d+]/g, "");
+  let phone = cleanText(value).replace(/[^\d+]/g, "");
 
   if (!phone) {
     return "";
   }
 
-  /*
-    Remove the international + symbol because Meta expects
-    digits only.
-  */
   phone = phone.replace(/\D/g, "");
 
   if (!phone) {
     return "";
   }
 
-  /*
-    Convert:
-    0027618789393 -> 27618789393
-  */
   if (phone.startsWith("00")) {
     phone = phone.substring(2);
   }
 
-  /*
-    Convert:
-    0618789393 -> 27618789393
-  */
   if (phone.startsWith("0")) {
     phone = `27${phone.substring(1)}`;
   }
 
-  /*
-    Your CRM currently serves South African leads.
-    A local number missing the country code receives 27.
-  */
   if (!phone.startsWith("27")) {
     phone = `27${phone}`;
   }
 
-  /*
-    A South African WhatsApp number should normally contain
-    11 digits, including the country code.
-  */
   if (!/^27\d{9}$/.test(phone)) {
     return "";
   }
 
   return phone;
-}
