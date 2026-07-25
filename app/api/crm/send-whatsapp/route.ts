@@ -293,6 +293,17 @@ export async function POST(req: NextRequest) {
 
     const sentAt = new Date().toISOString();
 
+    if (!externalMessageId) {
+      console.warn(
+        "Meta accepted the request but did not return a WhatsApp message ID.",
+        {
+          leadId: lead.id,
+          recipient: phone,
+          response: whatsappResult,
+        }
+      );
+    }
+
     const leadDisplayName =
       String(lead.full_name || "").trim() ||
       [lead.first_name, lead.surname]
@@ -305,8 +316,7 @@ export async function POST(req: NextRequest) {
       ? message || `WhatsApp template sent: ${templateName}`
       : message;
 
-    const deliveryStatus =
-      whatsappResult.messages?.[0]?.message_status || "accepted";
+    const deliveryStatus = "accepted";
 
     /*
       Save the outbound message in the same columns used by the webhook.
