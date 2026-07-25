@@ -311,24 +311,37 @@ export async function POST(req: NextRequest) {
       This uses only the core columns already used by the working webhook,
       making it compatible with the existing table structure.
     */
+    const deliveryStatus =
+      whatsappResult.messages?.[0]?.message_status || "accepted";
+
     const whatsappMessagePayload = {
       lead_id: lead.id,
       phone,
       direction: "outbound",
+
       message_text: storedMessage,
-      raw_payload: {
-        ...whatsappResult,
-        message_tracking: {
-          external_message_id: externalMessageId,
-          message_type: useTemplate ? "template" : "text",
-          template_name: useTemplate ? templateName : null,
-          sender_phone_number_id: phoneNumberId,
-          recipient: phone,
-          sent_at: sentAt,
-          delivery_status: "sent",
-        },
-      },
+      message: storedMessage,
+
+      whatsapp_message_id: externalMessageId,
+      external_message_id: externalMessageId,
+
+      status: deliveryStatus,
+      delivery_status: deliveryStatus,
+
+      template_name: useTemplate ? templateName : null,
+
+      sent_at: sentAt,
+      received_at: null,
+      delivered_at: null,
+      read_at: null,
+      failed_at: null,
+
+      status_payload: null,
+      status_error: null,
+
+      raw_payload: whatsappResult,
       created_at: sentAt,
+      updated_at: sentAt,
     };
 
     const { error: whatsappMessageInsertError } = await supabase
@@ -341,6 +354,15 @@ export async function POST(req: NextRequest) {
         message: whatsappMessageInsertError.message,
         details: whatsappMessageInsertError.details,
         hint: whatsappMessageInsertError.hint,
+      });
+    }
+    else {
+      console.log("WHATSAPP MESSAGE SAVED:", {
+        leadId: lead.id,
+        recipient: phone,
+        externalMessageId,
+        deliveryStatus,
+        sentAt,
       });
     }
 
@@ -412,7 +434,7 @@ export async function POST(req: NextRequest) {
       .insert(activityPayload);
 
     if (activityError) {
-      console.error("Failed to save WhatsApp activity:", {
+      console.warn("WhatsApp activity was not saved:", {
         code: activityError.code,
         message: activityError.message,
         details: activityError.details,
@@ -428,6 +450,7 @@ export async function POST(req: NextRequest) {
       leadId: lead.id,
       leadName: leadDisplayName,
       messageType: useTemplate ? "template" : "text",
+      deliveryStatus,
       sentAt,
       localStorage: {
         leadMessagesSaved: !messageInsertError,
