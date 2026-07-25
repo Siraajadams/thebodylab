@@ -657,3 +657,4 @@ function normalizePhoneNumber(value: unknown): string {
   }
 
   return phone;
+}
