@@ -305,15 +305,13 @@ export async function POST(req: NextRequest) {
       ? message || `WhatsApp template sent: ${templateName}`
       : message;
 
-    /*
-      Save the outbound message first in whatsapp_messages.
-
-      This uses only the core columns already used by the working webhook,
-      making it compatible with the existing table structure.
-    */
     const deliveryStatus =
       whatsappResult.messages?.[0]?.message_status || "accepted";
 
+    /*
+      Save the outbound message in the same columns used by the webhook.
+      The Meta wamid is the key used later for sent/delivered/read updates.
+    */
     const whatsappMessagePayload = {
       lead_id: lead.id,
       phone,
@@ -344,9 +342,12 @@ export async function POST(req: NextRequest) {
       updated_at: sentAt,
     };
 
-    const { error: whatsappMessageInsertError } = await supabase
-      .from("whatsapp_messages")
-      .insert(whatsappMessagePayload);
+    const { data: savedWhatsAppMessage, error: whatsappMessageInsertError } =
+      await supabase
+        .from("whatsapp_messages")
+        .insert(whatsappMessagePayload)
+        .select("id")
+        .maybeSingle();
 
     if (whatsappMessageInsertError) {
       console.error("Failed to save whatsapp_messages record:", {
@@ -354,10 +355,11 @@ export async function POST(req: NextRequest) {
         message: whatsappMessageInsertError.message,
         details: whatsappMessageInsertError.details,
         hint: whatsappMessageInsertError.hint,
+        payload: whatsappMessagePayload,
       });
-    }
-    else {
+    } else {
       console.log("WHATSAPP MESSAGE SAVED:", {
+        id: savedWhatsAppMessage?.id || null,
         leadId: lead.id,
         recipient: phone,
         externalMessageId,
@@ -527,4 +529,3 @@ function normalizePhoneNumber(value: unknown): string {
   }
 
   return phone;
-}
