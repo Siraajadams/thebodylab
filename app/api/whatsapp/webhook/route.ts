@@ -243,6 +243,28 @@ async function sendWhatsAppText(phone: string, message: string) {
   });
 }
 
+async function messageExists(externalMessageId: string) {
+  if (!externalMessageId) return false;
+
+  const supabase = getSupabase();
+
+  const { data, error } = await supabase
+    .from("whatsapp_messages")
+    .select("id")
+    .or(
+      `external_message_id.eq.${externalMessageId},whatsapp_message_id.eq.${externalMessageId}`
+    )
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("WHATSAPP MESSAGE DUPLICATE CHECK ERROR:", error);
+    return false;
+  }
+
+  return Boolean(data?.id);
+}
+
 async function saveMessage(
   phone: string,
   messageText: string,
@@ -254,31 +276,54 @@ async function saveMessage(
     eventTime?: string | null;
     deliveryStatus?: string | null;
     messageType?: string | null;
+    templateName?: string | null;
   }
 ) {
   const supabase = getSupabase();
   const cleanPhone = normalisePhone(phone);
   const eventTime = tracking?.eventTime || new Date().toISOString();
+  const externalMessageId = cleanText(tracking?.externalMessageId) || null;
+  const deliveryStatus =
+    cleanText(tracking?.deliveryStatus) ||
+    (direction === "inbound" ? "received" : "accepted");
+
+  if (externalMessageId && (await messageExists(externalMessageId))) {
+    console.log("DUPLICATE WHATSAPP MESSAGE IGNORED:", {
+      externalMessageId,
+      direction,
+      phone: cleanPhone,
+    });
+    return true;
+  }
 
   const payload = {
-    phone: cleanPhone,
     lead_id: leadId || null,
-    message_text: messageText,
+    phone: cleanPhone,
     direction,
-    raw_payload: {
-      ...(rawPayload && typeof rawPayload === "object" ? rawPayload : {}),
-      message_tracking: {
-        external_message_id: tracking?.externalMessageId || null,
-        event_time: eventTime,
-        delivery_status:
-          tracking?.deliveryStatus ||
-          (direction === "inbound" ? "received" : "accepted"),
-        message_type: tracking?.messageType || "text",
-        sender: direction === "inbound" ? cleanPhone : PHONE_NUMBER_ID,
-        recipient: direction === "inbound" ? PHONE_NUMBER_ID : cleanPhone,
-      },
-    },
+
+    message_text: messageText,
+    message: messageText,
+
+    whatsapp_message_id: externalMessageId,
+    external_message_id: externalMessageId,
+
+    status: deliveryStatus,
+    delivery_status: deliveryStatus,
+
+    template_name: tracking?.templateName || null,
+
+    sent_at: direction === "outbound" ? eventTime : null,
+    received_at: direction === "inbound" ? eventTime : null,
+    delivered_at: null,
+    read_at: null,
+    failed_at: deliveryStatus === "failed" ? eventTime : null,
+
+    status_payload: null,
+    status_error: null,
+
+    raw_payload: rawPayload || null,
     created_at: eventTime,
+    updated_at: eventTime,
   };
 
   const { data, error } = await supabase
@@ -290,11 +335,12 @@ async function saveMessage(
   if (!error) {
     console.log("WHATSAPP MESSAGE SAVED:", {
       id: data?.id || null,
-      phone: cleanPhone,
       leadId: leadId || null,
+      phone: cleanPhone,
       direction,
+      deliveryStatus,
+      externalMessageId,
       eventTime,
-      externalMessageId: tracking?.externalMessageId || null,
     });
     return true;
   }
@@ -312,12 +358,9 @@ async function saveMessage(
       ...payload,
       lead_id: null,
       raw_payload: {
-        ...payload.raw_payload,
-        message_tracking: {
-          ...payload.raw_payload.message_tracking,
-          original_lead_id: leadId,
-          save_fallback: "lead_id_removed",
-        },
+        original_payload: rawPayload || null,
+        original_lead_id: leadId,
+        save_fallback: "lead_id_removed",
       },
     };
 
@@ -331,18 +374,12 @@ async function saveMessage(
       console.warn("WHATSAPP MESSAGE SAVED WITHOUT LEAD ID:", {
         id: fallbackData?.id || null,
         originalLeadId: leadId,
-        phone: cleanPhone,
-        direction,
+        externalMessageId,
       });
       return true;
     }
 
-    console.error("WHATSAPP MESSAGE FALLBACK SAVE ERROR:", {
-      code: fallbackError.code,
-      message: fallbackError.message,
-      details: fallbackError.details,
-      hint: fallbackError.hint,
-    });
+    console.error("WHATSAPP MESSAGE FALLBACK SAVE ERROR:", fallbackError);
   }
 
   return false;
@@ -369,6 +406,58 @@ async function reply(phone: string, message: string, leadId?: string | null) {
   }
 
   return result;
+}
+
+async function updateMessageStatuses(statuses: WhatsAppStatus[]) {
+  if (!Array.isArray(statuses) || statuses.length === 0) return;
+
+  const supabase = getSupabase();
+
+  for (const statusEvent of statuses) {
+    const externalMessageId = cleanText(statusEvent.id);
+    const deliveryStatus = cleanText(statusEvent.status) || "unknown";
+    const eventTime = statusEvent.timestamp
+      ? new Date(Number(statusEvent.timestamp) * 1000).toISOString()
+      : new Date().toISOString();
+
+    if (!externalMessageId) continue;
+
+    const updatePayload: Record<string, unknown> = {
+      status: deliveryStatus,
+      delivery_status: deliveryStatus,
+      status_payload: statusEvent,
+      status_error: statusEvent.errors || null,
+      updated_at: new Date().toISOString(),
+    };
+
+    if (deliveryStatus === "sent") updatePayload.sent_at = eventTime;
+    if (deliveryStatus === "delivered") updatePayload.delivered_at = eventTime;
+    if (deliveryStatus === "read") updatePayload.read_at = eventTime;
+    if (deliveryStatus === "failed") updatePayload.failed_at = eventTime;
+
+    const { data, error } = await supabase
+      .from("whatsapp_messages")
+      .update(updatePayload)
+      .or(
+        `external_message_id.eq.${externalMessageId},whatsapp_message_id.eq.${externalMessageId}`
+      )
+      .select("id");
+
+    if (error) {
+      console.error("WHATSAPP STATUS UPDATE ERROR:", {
+        externalMessageId,
+        deliveryStatus,
+        error,
+      });
+    } else {
+      console.log("WHATSAPP STATUS UPDATED:", {
+        externalMessageId,
+        deliveryStatus,
+        eventTime,
+        matchedRecords: data?.length || 0,
+      });
+    }
+  }
 }
 
 async function getSession(phone: string) {
@@ -631,11 +720,11 @@ export async function POST(req: NextRequest) {
     const statuses = (value?.statuses || []) as WhatsAppStatus[];
 
     if (statuses.length > 0) {
-      console.log("WHATSAPP STATUS EVENT:", statuses);
+      await updateMessageStatuses(statuses);
 
       return NextResponse.json({
         success: true,
-        message: "WhatsApp status event received.",
+        message: "WhatsApp status events processed.",
         statusesProcessed: statuses.length,
       });
     }
