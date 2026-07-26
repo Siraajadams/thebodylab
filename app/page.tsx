@@ -101,6 +101,8 @@ type MessageTemplate = {
   key: MessageTemplateKey;
   name: string;
   emailSubject: string;
+  whatsappTemplateName: string | null;
+  whatsappTemplateApproved: boolean;
   buildMessage: (lead: Lead) => string;
 };
 
@@ -109,6 +111,8 @@ const messageTemplates: MessageTemplate[] = [
     key: "initial_follow_up",
     name: "Initial enquiry follow-up",
     emailSubject: "Your BodyLab enquiry",
+    whatsappTemplateName: "bodylab_welcome",
+    whatsappTemplateApproved: true,
     buildMessage: (lead) => `Hi ${lead.first_name || "there"},
 
 Thank you for your interest in BodyLab.
@@ -129,6 +133,8 @@ BodyLab Team`,
     key: "booking_reminder",
     name: "Consultation booking reminder",
     emailSubject: "Reminder to book your BodyLab consultation",
+    whatsappTemplateName: "bodylab_booking",
+    whatsappTemplateApproved: false,
     buildMessage: (lead) => `Hi ${lead.first_name || "there"},
 
 This is a friendly reminder to book your BodyLab consultation for ${
@@ -147,6 +153,8 @@ BodyLab Team`,
     key: "appointment_confirmation",
     name: "Appointment confirmation",
     emailSubject: "Your BodyLab appointment is confirmed",
+    whatsappTemplateName: "bodylab_appointment_confirmation",
+    whatsappTemplateApproved: false,
     buildMessage: (lead) => `Hi ${lead.first_name || "there"},
 
 Your BodyLab appointment has been confirmed.
@@ -162,6 +170,8 @@ BodyLab Team`,
     key: "missed_follow_up",
     name: "Missed enquiry follow-up",
     emailSubject: "Are you still interested in BodyLab?",
+    whatsappTemplateName: "bodylab_followup",
+    whatsappTemplateApproved: false,
     buildMessage: (lead) => `Hi ${lead.first_name || "there"},
 
 We recently contacted you regarding your interest in ${
@@ -179,6 +189,8 @@ BodyLab Team`,
     key: "post_consultation",
     name: "Post-consultation follow-up",
     emailSubject: "BodyLab follow-up",
+    whatsappTemplateName: "bodylab_progress",
+    whatsappTemplateApproved: false,
     buildMessage: (lead) => `Hi ${lead.first_name || "there"},
 
 Thank you for attending your BodyLab consultation.
@@ -192,6 +204,8 @@ BodyLab Team`,
     key: "custom",
     name: "Custom message",
     emailSubject: "Message from BodyLab",
+    whatsappTemplateName: null,
+    whatsappTemplateApproved: true,
     buildMessage: () => "",
   },
 ];
@@ -448,7 +462,7 @@ export default function Home() {
   }
 
   async function sendContactMessage() {
-    if (!contactLead) return;
+    if (!contactLead || sendingMessage) return;
 
     if (!contactMessage.trim()) {
       setContactResult("Please enter a message.");
@@ -457,6 +471,27 @@ export default function Home() {
 
     if (contactChannel === "email" && !contactSubject.trim()) {
       setContactResult("Please enter an email subject.");
+      return;
+    }
+
+    const activeTemplate =
+      messageTemplates.find(
+        (template) => template.key === selectedTemplate
+      ) || messageTemplates[0];
+
+    /*
+      Never silently send bodylab_welcome when another predetermined
+      WhatsApp message was selected. Each predetermined message must
+      be linked to its own approved Meta template.
+    */
+    if (
+      contactChannel === "whatsapp" &&
+      selectedTemplate !== "custom" &&
+      !activeTemplate.whatsappTemplateApproved
+    ) {
+      setContactResult(
+        `The Meta template "${activeTemplate.whatsappTemplateName}" has not been approved yet. Create and approve it in WhatsApp Manager before sending this predetermined message.`
+      );
       return;
     }
 
@@ -474,13 +509,23 @@ export default function Home() {
           ? {
               leadId: contactLead.id,
               message: contactMessage,
+              templateName:
+                selectedTemplate === "custom"
+                  ? undefined
+                  : activeTemplate.whatsappTemplateName,
+              templateVariables: [],
+              forceTemplate:
+                selectedTemplate !== "custom" &&
+                Boolean(activeTemplate.whatsappTemplateName),
             }
           : {
               leadId: contactLead.id,
               subject: contactSubject,
               message: contactMessage,
               templateKey:
-                selectedTemplate === "custom" ? null : selectedTemplate,
+                selectedTemplate === "custom"
+                  ? null
+                  : selectedTemplate,
             };
 
       const response = await fetch(endpoint, {
@@ -494,14 +539,21 @@ export default function Home() {
       const result = await response.json();
 
       if (!response.ok) {
-        throw new Error(result?.error || "The message could not be sent.");
+        throw new Error(
+          result?.details ||
+            result?.error ||
+            "The message could not be sent."
+        );
       }
 
-      setContactResult(
-        `${
-          contactChannel === "whatsapp" ? "WhatsApp" : "Email"
-        } sent successfully.`
-      );
+      const sentLabel =
+        contactChannel === "whatsapp"
+          ? result?.templateName
+            ? `WhatsApp template "${result.templateName}"`
+            : "WhatsApp message"
+          : "Email";
+
+      setContactResult(`${sentLabel} sent successfully.`);
 
       await loadLeads();
       await loadMessages(contactLead.id);
@@ -983,6 +1035,49 @@ export default function Home() {
                 </option>
               ))}
             </select>
+
+            {contactChannel === "whatsapp" &&
+              selectedTemplate !== "custom" && (
+                <p
+                  style={{
+                    marginTop: 8,
+                    marginBottom: 4,
+                    fontSize: 13,
+                    color:
+                      (
+                        messageTemplates.find(
+                          (template) =>
+                            template.key === selectedTemplate
+                        ) || messageTemplates[0]
+                      ).whatsappTemplateApproved
+                        ? "#166534"
+                        : "#b45309",
+                  }}
+                >
+                  Meta template:{" "}
+                  <b>
+                    {
+                      (
+                        messageTemplates.find(
+                          (template) =>
+                            template.key === selectedTemplate
+                        ) || messageTemplates[0]
+                      ).whatsappTemplateName
+                    }
+                  </b>
+                  {" · "}
+                  {
+                    (
+                      messageTemplates.find(
+                        (template) =>
+                          template.key === selectedTemplate
+                      ) || messageTemplates[0]
+                    ).whatsappTemplateApproved
+                      ? "Approved and ready"
+                      : "Not approved yet"
+                  }
+                </p>
+              )}
 
             {contactChannel === "email" && (
               <>
