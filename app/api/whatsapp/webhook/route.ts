@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { createHmac, timingSafeEqual } from "node:crypto";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,16 +11,6 @@ const META_API_VERSION =
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "";
 const WHATSAPP_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN || "";
 const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || "";
-
-function verifyMetaSignature(raw: string, signature: string | null): boolean {
-  const secret = process.env.META_APP_SECRET?.trim();
-  if (!secret || !signature?.startsWith("sha256=")) return false;
-  const supplied = signature.slice(7);
-  if (!/^[a-f0-9]{64}$/i.test(supplied)) return false;
-  const expected = createHmac("sha256", secret).update(raw).digest();
-  return timingSafeEqual(expected, Buffer.from(supplied, "hex"));
-}
-
 
 // Your live BodyLab production Phone Number ID.
 // This is used only as a safety check and not as a secret.
@@ -203,34 +192,22 @@ async function callWhatsAppApi(payload: Record<string, unknown>): Promise<SendRe
     cache: "no-store",
   });
 
-  const responseText = await response.text();
-  let data: any;
-  try {
-    data = JSON.parse(responseText);
-  } catch {
-    data = { raw: responseText.slice(0, 1000) };
-  }
+  const data = await response.json().catch(async () => ({
+    raw: await response.text().catch(() => ""),
+  }));
+
+  console.log("META RESPONSE:", {
+    ok: response.ok,
+    status: response.status,
+    phoneNumberId: PHONE_NUMBER_ID,
+    data,
+  });
 
   if (!response.ok) {
-    // Keep diagnostics readable in Vercel without logging access tokens,
-    // customer phone numbers, or message contents.
-    const metaError = data?.error || {};
-    console.error("META SEND ERROR", JSON.stringify({
-      httpStatus: response.status,
-      metaCode: metaError.code ?? null,
-      metaSubcode: metaError.error_subcode ?? null,
-      metaType: metaError.type ?? null,
-      metaMessage: metaError.message ?? data?.raw ?? "Unknown error",
-      metaDetails: metaError.error_data?.details ?? null,
-      fbtraceId: metaError.fbtrace_id ?? null,
-      operation: payload.status === "read" ? "mark_read" : "send_message",
-    }));
-  } else {
-    console.log("META REQUEST SUCCEEDED", JSON.stringify({
-      httpStatus: response.status,
-      operation: payload.status === "read" ? "mark_read" : "send_message",
-      messageId: data?.messages?.[0]?.id ?? null,
-    }));
+    console.error("META SEND ERROR:", {
+      status: response.status,
+      data,
+    });
   }
 
   return {
@@ -812,17 +789,9 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
-    const raw = await req.text();
-    if (!verifyMetaSignature(raw, req.headers.get("x-hub-signature-256"))) {
-      console.error("WHATSAPP WEBHOOK SIGNATURE INVALID OR META_APP_SECRET MISSING");
-      return NextResponse.json({ error: "Invalid webhook signature" }, { status: 403 });
-    }
-    const body = JSON.parse(raw);
+    const body = await req.json();
 
-    console.log("WHATSAPP WEBHOOK RECEIVED", JSON.stringify({
-      object: body?.object,
-      entries: Array.isArray(body?.entry) ? body.entry.length : 0,
-    }));
+    console.log("WHATSAPP WEBHOOK RECEIVED:", JSON.stringify(body));
 
     await saveWebhookEvent(body);
 
